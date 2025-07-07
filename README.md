@@ -1,251 +1,247 @@
-# my_swarm_pkg
-
-A ROS 2-based multi-UAV leader-follower swarm controller.  
-One **Leader** publishes trajectory setpoints and formation targets, and multiple **Follower** nodes consume those targets, avoid each other with repulsion, and track the leader’s movement and formation commands.
+# my_swarm_pkg  
+Multi-UAV leader–follower swarm control using ROS 2 and PX4 SITL (Gazebo Classic)
 
 ---
 
-## Table of Contents
-
-1. [Prerequisites](#prerequisites)  
-2. [Installation](#installation)  
-3. [Package structure](#package-structure)  
-4. [Launch file](#launch-file)  
-5. [Leader node (`leader_node`)](#leader-node-leader_node)  
-   1. [LeaderController class](#leadercontroller-class)  
-   2. [Key methods & functions](#key-methods--functions)  
-6. [Follower node (`follower_node`)](#follower-node-follower_node)  
-   1. [FollowerController class](#followercontroller-class)  
-   2. [Key methods & functions](#key-methods--functions-1)  
-7. [Topics & message flow](#topics--message-flow)  
-8. [Tuning parameters](#tuning-parameters)  
+## Table of Contents  
+1. [Overview](#overview)  
+2. [Prerequisites](#prerequisites)  
+3. [Installation](#installation)  
+4. [Usage / Launching](#usage--launching)  
+5. [Package Structure](#package-structure)  
+6. [Nodes & Classes](#nodes--classes)  
+7. [Topics & Message Flow](#topics--message-flow)  
+8. [Tuning Parameters](#tuning-parameters)  
 
 ---
 
-## Prerequisites
-
-1. Ubuntu 20.04 / 22.04  
-2. ROS 2 (e.g. Humble or Galactic) installed and sourced  
-3. `px4_msgs` package  
-4. Standard ROS 2 message packages:  
-   - `std_msgs`  
-   - `geometry_msgs`  
-5. Python 3 dependencies (handled by `package.xml`/`setup.py`)  
-
-You also need a working PX4 SITL or hardware setup for `/px4_N` namespaces.
+## Overview  
+This package implements a leader–follower formation control for a swarm of PX4-based VTOL/UAVs in Gazebo­ Classic using ROS 2. A single **LeaderController** node publishes setpoints and formation parameters; multiple **FollowerController** nodes subscribe, compute their local commands (including collision avoidance via repulsion), and send offboard commands back to PX4.
 
 ---
 
-## Installation
+## Prerequisites  
+
+1. **Operating System**  
+   - Ubuntu 20.04 LTS or Ubuntu 22.04 LTS  
+
+2. **ROS 2 (Humble / Galactic)**  
+   - Installation guide:  
+     https://docs.ros.org/en/rolling/Installation.html  
+   - After install:  
+     ```bash
+     source /opt/ros/<distro>/setup.bash
+     ```
+
+3. **PX4 Autopilot Firmware & Gazebo Classic SITL**  
+   - PX4 official instructions:  
+     https://docs.px4.io/master/en/dev_setup/dev_env.html  
+   - Build & run SITL with Gazebo Classic:  
+     ```bash
+     # clone PX4
+     git clone https://github.com/PX4/PX4-Autopilot.git ~/px4_firmware
+     cd ~/px4_firmware
+     # update submodules
+     git submodule update --init --recursive
+     # build for SITL + Gazebo Classic
+     make px4_sitl gazebo_classic
+     ```
+   - This will launch Gazebo Classic with the iris model in offboard-ready mode.
+
+4. **PX4–ROS 2 Bridge (px4_ros_com / px4_msgs)**  
+   - ROS 2 message definitions for PX4:  
+     https://github.com/PX4/px4_ros_com  
+   - Install via ROS 2 package index (if available) or build from source under your ROS 2 workspace:  
+     ```bash
+     cd ~/swarm_ws/src
+     git clone https://github.com/PX4/px4_ros_com.git
+     ```
+
+5. **ROS 2 Build Tools & Utilities**  
+   - `colcon`  
+   - `ros2launch`, `rclpy`  
+   - Standard ROS 2 message packages: `std_msgs`, `geometry_msgs`
+
+6. **Python 3** (3.8 or later)  
+   - Managed via `setup.py` / `package.xml`.  
+
+---
+
+## Installation  
 
 ```bash
-# 1. Source your ROS 2 installation:
+# 1. Source your ROS 2 install (e.g., Humble or Galactic)
 source /opt/ros/<distro>/setup.bash
 
-# 2. Create a workspace and clone this repo:
+# 2. Create your ROS 2 workspace & clone repositories
 mkdir -p ~/swarm_ws/src
 cd ~/swarm_ws/src
+
+# 2a. Clone PX4–ROS bridge (px4_ros_com) if not installed via apt
+git clone https://github.com/PX4/px4_ros_com.git
+
+# 2b. Clone this swarm package
 git clone git@github.com:<your-username>/my_swarm_pkg.git
 
-# 3. Build:
+# 3. Build the workspace
 cd ~/swarm_ws
-colcon build --packages-select my_swarm_pkg
+colcon build --packages-select px4_msgs my_swarm_pkg
 
-# 4. Source overlay:
+# 4. Source the overlay
 source install/setup.bash
 
 ---
 
-## Package structure
+## Usage / Launching  
 
+1. **Start PX4 SITL + Gazebo Classic**  
+   ```bash
+   cd ~/px4_firmware
+   make px4_sitl gazebo_classic
+   ```
+   – Wait until the PX4 SITL vehicle is armed and ready.
+
+2. **In a new terminal**, source ROS 2 and your workspace:
+   ```bash
+   source /opt/ros/<distro>/setup.bash
+   source ~/swarm_ws/install/setup.bash
+   ```
+
+3. **Launch the swarm**  
+   ```bash
+   ros2 launch my_swarm_pkg swarm_launch.py
+   ```
+
+4. **Send leader commands** (optional)  
+   - Teleoperate the leader:  
+     ```bash
+     ros2 topic pub /swarm/leader_cmd geometry_msgs/Twist '{ linear: { x: 1.0, y: 0.0, z: 0.0 } }'
+     ```  
+   - Set a formation:  
+     ```bash
+     ros2 topic pub /swarm/formation_cmd std_msgs/String '{ data: "square,5.0" }'
+     ```  
+   - Issue a waypoint:  
+     ```bash
+     ros2 topic pub /swarm/waypoint_cmd geometry_msgs/Point '{ x: 0.0, y: 0.0, z: -2.0 }'
+     ```  
+   - Apply rotation:  
+     ```bash
+     ros2 topic pub /swarm/rotation_cmd geometry_msgs/Vector3 '{ x: 0.0, y: 0.0, z: 1.57 }'
+     ```
+
+---
+
+## Package Structure  
 
 my_swarm_pkg/
 ├── package.xml
 ├── setup.py
 ├── launch/
-│   └── swarm_launch.py
+│   └── swarm_launch.py         # Launches leader & 4 followers
 ├── resource/
-│   └── my_swarm_pkg  ← entry-point marker
+│   └── my_swarm_pkg            # Marker for setup.py
 ├── my_swarm_pkg/
-│   ├── leader_follower.py   ← leader & built-in follower classes
-│   ├── follower_node.py     ← standalone follower node
-│   └── constants.py         ← common constants (Z_CMD, KP_POS, etc.)
+│   ├── constants.py            # RATE_HZ, KP_POS, OFFSETS, …
+│   ├── leader_follower.py      # LeaderController + embedded FollowerController
+│   └── follower_node.py        # Standalone FollowerController executable
 └── README.md
 
 ---
 
-## Launch file
+## Nodes & Classes  
 
-**`launch/swarm_launch.py`** brings up one leader node and four follower nodes:
+### 1. LeaderController (leader_follower.py)  
+- Namespace: `/px4_1`  
+- Publishes:  
+  - OffboardControlMode  
+  - TrajectorySetpoint  
+  - VehicleCommand (ARM & set mode)  
+  - `/swarm/follower_targets` (String)  
 
-python
-def generate_launch_description():
-return LaunchDescription([
-Node(package='my_swarm_pkg', executable='leader_node', name='leader',  namespace='swarm'),
-Node(package='my_swarm_pkg', executable='follower_node', name='follower_uav2', namespace='uav2'),
-Node(package='my_swarm_pkg', executable='follower_node', name='follower_uav3', namespace='uav3'),
-Node(package='my_swarm_pkg', executable='follower_node', name='follower_uav4', namespace='uav4'),
-Node(package='my_swarm_pkg', executable='follower_node', name='follower_uav5', namespace='uav5'),
-])
+- Subscribes:  
+  - `/px4_1/fmu/out/vehicle_odometry` (VehicleOdometry)  
+  - `/swarm/leader_cmd` (Twist)  
+  - `/swarm/waypoint_cmd` (Point)  
+  - `/swarm/formation_cmd` (String)  
+  - `/swarm/rotation_cmd` (Vector3)  
+  - `/swarm/follower_arrived` (String)  
+  - `/px4_{i}/fmu/out/vehicle_odometry` for each follower  
 
-Usage:
+- Core loop (`20 Hz`):  
+  1. Publish offboard mode  
+  2. Move leader (P-control to waypoint or dead-reckoning)  
+  3. Compute formation offsets → apply roll/pitch/yaw rotations → build target list  
+  4. Estimate travel time & publish `/swarm/follower_targets`  
+  5. ARM & set mode once (after ~1 s)  
 
-bash
-ros2 launch my_swarm_pkg swarm_launch.py
+### 2. FollowerController (follower_node.py)  
+- Namespace: `/uav2`, `/uav3`, `/uav4`, `/uav5` → translates to `/px4_2`…`/px4_5` internally  
+- Publishes:  
+  - OffboardControlMode  
+  - TrajectorySetpoint  
+  - VehicleCommand (ARM & set mode)  
+  - `/swarm/follower_arrived` (String)  
+  - `/px4_{i+2}/follower_err` (Float32)  
 
----
+- Subscribes:  
+  - Leader odometry `/px4_1/fmu/out/vehicle_odometry`  
+  - Own odometry `/px4_{i}/fmu/out/vehicle_odometry`  
+  - Neighbor odometries for repulsion  
+  - `/swarm/follower_targets` (String)  
+  - `/swarm/waypoint_cmd` (Point) to reset arrival flag  
 
-## Leader node (`leader_node`)
-
-Implemented in `leader_follower.py` as class **`LeaderController`**.
-
-### LeaderController class
-
-- **Namespace**: `px4_1`  
-- **Main responsibilities**  
-  1. Subscribe to its own odometry (`/px4_1/fmu/out/vehicle_odometry`)  
-  2. Accept external commands:  
-- `/swarm/leader_cmd` (geometry_msgs/Twist)  
-- `/swarm/waypoint_cmd` (geometry_msgs/Point)  
-- `/swarm/formation_cmd` (std_msgs/String)  
-- `/swarm/rotation_cmd` (geometry_msgs/Vector3)  
-  3. Track each follower’s odometry: `/px4_2…px4_4/fmu/out/vehicle_odometry`  
-  4. Publish:  
-- Offboard mode commands (`OffboardControlMode`)  
-- Trajectory setpoint (`TrajectorySetpoint`) for leader movement  
-- VehicleCommand to arm & set mode  
-- `/swarm/follower_targets` (std_msgs/String) listing each follower’s target position & arrival time  
-
-- **Node timer** at 20 Hz runs `control_loop()`.
-
-### Key methods & functions
-
-1. **quaternion_to_yaw(q)**  
-   Convert quaternion `[x,y,z,w]` to yaw angle.
-
-2. **compute_formation_positions(cx, cy, formation, spacing, N)**  
-   Returns a list of 2D offsets for `N` followers in:  
-   - “line”  
-   - “square”  
-   - or custom OFFSETS fallback.
-
-3. **send_cmd(command, p1=0, p2=0)**  
-   Publish a `VehicleCommand` to arm/disarm or change mode.
-
-4. **control_loop()**  
-   - **Arm & set offboard** after 1 s (20 ticks).  
-   - **Leader motion**  
-- If `waypoint_cmd` active: P-control toward waypoint;  
-- Else use last `/swarm/leader_cmd` Twist to dead-reckon.  
-   - **Formation**  
-- Compute formation points around current leader position.  
-- Apply 3D rotations (roll, pitch, yaw) from `/swarm/rotation_cmd`.  
-- Compute per-follower travel times (based on max distance & spacing speed).  
-- Publish `/swarm/follower_targets` as semicolon-separated `idx,x,y,z,arrival_time`.  
+- Core loop (`20 Hz`):  
+  1. Publish offboard mode  
+  2. Compute feed-forward & P-control to assigned offset  
+  3. Add repulsion forces if neighbors < threshold  
+  4. Cap velocity magnitude to REPULSION_THRESHOLD  
+  5. Zero velocity & publish “arrived” once if within ARRIVAL_THRESHOLD  
+  6. Publish final TrajectorySetpoint  
+  7. ARM & set offboard once after ~1 s  
 
 ---
 
-## Follower node (`follower_node`)
-
-Two variants exist:
-
-1. **Built-in** follower in `leader_follower.py` under class `FollowerController`.  
-2. **Standalone** in `follower_node.py` (very similar).
-
-Below describes the standalone one in `follower_node.py`.
-
-### FollowerController class
-
-- Each instance runs under its PX4 namespace (`px4_{idx+2}`), e.g. `px4_2_follower`.  
-- **Subscriptions**  
-  - Leader odometry: `/px4_1/fmu/out/vehicle_odometry`  
-  - Own odometry: `/<ns>/fmu/out/vehicle_odometry`  
-  - Other followers’ odometry (for repulsion)  
-  - `/swarm/follower_targets` (std_msgs/String) → updates offset, target z, arrival time  
-  - `/swarm/waypoint_cmd` resets arrival flag  
-
-- **Publishers**  
-  - Offboard mode: `<ns>/fmu/in/offboard_control_mode`  
-  - Trajectory setpoint: `<ns>/fmu/in/trajectory_setpoint`  
-  - VehicleCommand (to arm/set mode)  
-  - Follower error: `/px4_{i+2}/follower_err`  
-  - Arrival notification: `/swarm/follower_arrived`  
-
-- **Timer** at 20 Hz runs `control_loop()`.
-
-### Key methods & functions
-
-1. **target_cb(msg)**  
-   Parses one entry `idx,x,y,z,t` from `/swarm/follower_targets`, picks the matching `idx` and updates:  
-   - `offset = (x, y)`  
-   - `z_target = z`  
-   - `t_arrival = t`  
-   - `arrived = False`
-
-2. **_neighbor_cb(j, msg)**  
-   Store neighbor `j`’s position for repulsive avoidance.
-
-3. **send_cmd(command, p1=0, p2=0)**  
-   Publish a `VehicleCommand` for arming or setting offboard mode.
-
-4. **control_loop()**  
-   - **Arm & set offboard** after 1 s.  
-   - Compute **remaining time** to arrival.  
-   - **Feed-forward** velocity = `(desired_position - current_position) / remaining_time` (zero if `<0.1 s`).  
-   - **Proportional** velocity = `KP_POS * position_error`.  
-   - **Repulsion**  
-- If two followers closer than `REPULSION_THRESHOLD`, add a repulsive vector.  
-   - **Velocity cap** at `REPULSION_THRESHOLD`.  
-   - **Zero velocity & publish arrival** once error below `ARRIVAL_THRESHOLD`.  
-   - Publish final `TrajectorySetpoint` with current pos, computed vel, and leader’s yaw.  
-
----
-
-## Topics & message flow
-
+## Topics & Message Flow  
 | Topic                                    | Msg Type                | Publisher            | Subscriber(s)         |
 |------------------------------------------|-------------------------|----------------------|-----------------------|
-| /px4_1/fmu/out/vehicle_odometry          | px4_msgs/VehicleOdometry| Flight stack (leader)| Leader, followers     |
-| /swarm/leader_cmd                        | geometry_msgs/Twist     | User / teleop node   | Leader                |
-| /swarm/waypoint_cmd                      | geometry_msgs/Point     | User / planner       | Leader, followers     |
-| /swarm/formation_cmd                     | std_msgs/String         | User                  | Leader                |
-| /swarm/rotation_cmd                      | geometry_msgs/Vector3   | User                  | Leader                |
-| /swarm/follower_targets                  | std_msgs/String         | Leader               | Followers             |
-| /swarm/follower_arrived                  | std_msgs/String         | Followers            | Leader                |
-| `<ns>/fmu/in/offboard_control_mode`      | px4_msgs/OffboardControlMode| Leader/Follower  | PX4 FMU               |
-| `<ns>/fmu/in/trajectory_setpoint`        | px4_msgs/TrajectorySetpoint| Leader/Follower  | PX4 FMU               |
-| `<ns>/fmu/in/vehicle_command`            | px4_msgs/VehicleCommand | Leader/Follower      | PX4 FMU               |
+| `/px4_1/fmu/out/vehicle_odometry`        | VehicleOdometry         | PX4 SITL (leader)    | Leader + all Followers |
+| `/swarm/leader_cmd`                      | geometry_msgs/Twist     | Operator / Teleop    | Leader                |
+| `/swarm/waypoint_cmd`                    | geometry_msgs/Point     | Planner / Operator   | Leader, Followers     |
+| `/swarm/formation_cmd`                   | std_msgs/String         | Operator             | Leader                |
+| `/swarm/rotation_cmd`                    | geometry_msgs/Vector3   | Operator             | Leader                |
+| `/swarm/follower_targets`                | std_msgs/String         | Leader               | Followers             |
+| `/swarm/follower_arrived`                | std_msgs/String         | Followers            | Leader                |
+| `<ns>/fmu/in/offboard_control_mode`      | OffboardControlMode     | Leader / Followers   | PX4 FMU               |
+| `<ns>/fmu/in/trajectory_setpoint`        | TrajectorySetpoint      | Leader / Followers   | PX4 FMU               |
+| `<ns>/fmu/in/vehicle_command`            | VehicleCommand          | Leader / Followers   | PX4 FMU               |
+| `/px4_{i+2}/follower_err`                | Float32                 | Followers            | Monitoring (optional) |
 
 ---
 
-## Tuning parameters
-
-Defined in `constants.py` (or top of scripts):
+## Tuning Parameters  
+Defined in **`constants.py`** (and top of scripts):
 
 python
-RATE_HZ = 20.0
-Z_CMD = -1.0
-OFFSETS = [(0,3),(0,-30),(-30,0)]
-KP_POS = 0.6
-ARRIVAL_THRESHOLD = 0.2
-REPULSION_GAIN = 1.0
-REPULSION_THRESHOLD = 1.5
+RATE_HZ             = 20.0        # control loop frequency (Hz)
+Z_CMD               = -1.0        # default target altitude (m)
+OFFSETS             = [(0.0,3.0), (0.0,-30.0), (-30.0,0.0)]
+N_FOLLOW            = len(OFFSETS)
+KP_POS              = 0.6         # P-gain for position controller
+ARRIVAL_THRESHOLD   = 0.2         # [m] threshold to consider “arrived”
+REPULSION_GAIN      = 1.0         # gain for inter-agent repulsion
+REPULSION_THRESHOLD = 1.5         # [m] minimum repulsion distance
 
-Adjust spacing, gains, and thresholds to suit your UAV dynamics and formation scale.
+> **Note:** Adjust these parameters according to your UAV dynamics and desired formation size.
 
 ---
 
-With this setup, you can:
+## References & Links  
+- ROS 2 Installation: https://docs.ros.org/en/rolling/Installation.html  
+- PX4 Development Environment: https://docs.px4.io/master/en/dev_setup/dev_env.html  
+- PX4–ROS 2 Bridge (px4_ros_com): https://github.com/PX4/px4_ros_com  
+- Gazebo Classic Installation: http://gazebosim.org/tutorials?tut=install_ubuntu&cat=install  
 
-bash
-# 1. Launch swarm
-ros2 launch my_swarm_pkg swarm_launch.py
+---
 
-# 2. Send commands to leader, e.g.:
-ros2 topic pub /swarm/waypoint_cmd geometry_msgs/Point "{x: 0.0, y: 5.0, z: -2.0}"
-ros2 topic pub /swarm/formation_cmd std_msgs/String "data: 'square,4.0'"
-ros2 topic pub /swarm/rotation_cmd geometry_msgs/Vector3 "{x: 0.0, y: 0.0, z: 1.57}"
-
-Your followers will automatically receive updated targets, avoid collisions, and report arrival back to the leader.
-
-Enjoy your ROS 2 swarm!
+Thank you for using **my_swarm_pkg**! Feel free to raise issues or contribute on GitHub.
