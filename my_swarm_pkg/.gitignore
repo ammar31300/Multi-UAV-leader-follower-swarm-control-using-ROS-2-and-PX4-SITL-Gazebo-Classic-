@@ -1,0 +1,11 @@
+ROS build artifacts
+build/
+
+install/
+
+log/
+
+Python bytecode
+pycache/
+
+*.pyc
