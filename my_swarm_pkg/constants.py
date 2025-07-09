@@ -12,3 +12,7 @@ ARRIVAL_THRESHOLD = 0.2
 REPULSION_GAIN = 1.0
 REPULSION_THRESHOLD = 1.5
 formation_qos = QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+MIN_HORIZ_DELAY = 0.3   # ثانیه
+# در انتهای constants.py
+TAKEOFF_ALT = 2.0          # ارتفاع هدف برای Hold
+TAKEOFF_HYSTERESIS = 0.05  # برای جلوگیری از نوسان روی مرز
