@@ -13,6 +13,8 @@
   <depend>px4_ros_com</depend>
   <depend>microxrcedds_agent</depend>
   <depend>geometry_msgs</depend>
+  <depend>pygame</depend>
+
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
