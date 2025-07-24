@@ -94,9 +94,12 @@ class LeaderController(Node):
         self.followers = {}       # idx->(x,y)
         self.arrived_followers = set()
         self.arm_wait_counter = 0
+        self.prev_error = (0.0, 0.0, 0.0)
+        self.prev_time  = None
         # initial rotation angles (roll,pitch,yaw)
         self.rotation_angles = (0.0, 0.0, 0.0)
-
+        self.takeoff_altitude = 2.0     # متر
+        self.took_off = False
         # --- subscriptions
         self.create_subscription(
             VehicleOdometry,
@@ -173,16 +176,23 @@ class LeaderController(Node):
 
     def _follower_status_cb(self, idx, msg):
         p = msg.position
-        self.followers[idx] = (p[0], p[1])
+        self.followers[idx] = (p[0], p[1], p[2])
 
     def send_cmd(self, command, p1=0.0, p2=0.0):
+        # ایجاد پیام و timestamp
+        ts = int(self.get_clock().now().nanoseconds / 1e3)
         c = VehicleCommand()
+        c.timestamp        = ts
         c.command = command
         c.param1 = p1
         c.param2 = p2
         c.target_system = int(LEADER_NS.split('_')[1]) + 1
         c.target_component = 1
-        c.from_external = True
+        # فرستنده هم باید مشخص شود
+        c.source_system    = c.target_system
+        c.source_component = 1
+        c.from_external    = True
+        c.confirmation     = 0
         self.cmd_pub.publish(c)
 
     # --- main control loop
@@ -190,112 +200,225 @@ class LeaderController(Node):
         if not self.pose:
             return
 
+        # timestamp و زمان فعلی
         ts = int(self.get_clock().now().nanoseconds / 1e3)
         now = self.get_clock().now().nanoseconds / 1e9
 
-        # Always publish Offboard(position=True)
+        # همیشه در هر چرخه Offboard(position=True) منتشر شود
+        # ۱) OffboardControlMode را هر بار بفرست
         self.mode_pub.publish(OffboardControlMode(timestamp=ts, position=True))
 
-        # 1) ARMED / TAKEOFF logic (once)
-        self.arm_wait_counter += 1
-        if not self.armed and self.arm_wait_counter > RATE_HZ:
-            self.get_logger().info("Arming leader and switching to OFFBOARD")
-            self.send_cmd(400, 1.0)       # ARM
-            self.send_cmd(176, 1.0, 6.0)  # OFFBOARD
-            self.armed = True
+        # ۲) یک TrajectorySetpoint پایه بفرست تا PX4 Offboard را فعال کند
+        #    (در فاز اول می‌توانیم ارتفاع takeoff_altitude را بدهیم)
+        q = self.pose.q
+        yaw_now = quaternion_to_yaw((q[0], q[1], q[2], q[3]))
+        z_sp = self.takeoff_altitude if not self.took_off else self.pose.position[2]
+        sp = TrajectorySetpoint()
+        sp.timestamp  = ts
+        sp.position   = [
+            float(self.pose.position[0]),
+            float(self.pose.position[1]),
+            float(z_sp),
+        ]
+        sp.yaw        = float(yaw_now)
+        # اگر دوست دارید سرعت صفر صادر کنید:
+        sp.velocity   = [0.0, 0.0, 0.0]
+        self.traj_pub.publish(sp)
+
+        # ۳) اگر هنوز Armed نشده‌ایم، handshake OFFBOARD → ARM
+        if not self.armed:
+            self.arm_wait_counter += 1
+            # ۳a) ارسال MAV_CMD_DO_SET_MODE برای ورود به OFFBOARD یکبار
+            if self.arm_wait_counter == 1:
+                self.send_cmd(
+                    VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
+                    1.0,    # custom mode
+                    6.0     # 6 = OFFBOARD
+                )
+            # ۳b) بعد از ~1 ثانیه، فرمان ARM را بفرست
+            if self.arm_wait_counter == int(RATE_HZ * 1.0):
+                self.send_cmd(
+                    VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
+                    1.0,    # arm = 1
+                    0.0
+                )
+            # ۳c) بعد از ~1.5 ثانیه، وضعیت Armed را تغییر بده و به مرحله بعد برو
+            if self.arm_wait_counter > int(RATE_HZ * 1.5):
+                self.armed = True
+                self.took_off = False
+                self.get_logger().info(">> Leader armed and in OFFBOARD")
             return
+        
+        # --- ۲) تعیین manual_active ---
+        vx_cmd = vy_cmd = vz_cmd = 0.0
+        manual_active = False
+        if self.cmd_vel:
+            vx_cmd = self.cmd_vel.linear.x
+            vy_cmd = self.cmd_vel.linear.y
+            vz_cmd = self.cmd_vel.linear.z
+            if abs(vx_cmd) > 1e-3 or abs(vy_cmd) > 1e-3 or abs(vz_cmd) > 1e-3:
+                manual_active = True
 
-        # wait for waypoint or cmd_vel
-        if not self.waypoint:
-            # no specific waypoint → manual cmd_vel is handled below
-            pass
-
-        # 2) FORMATION computation
-        #   M = N_FOLLOW + 1 (leader + followers)
+        # --- ۳) محاسبه موقعیت‌های Formation (برای فالورها) ---
+        # مرکز Formation = موقعیت فعلی لیدر
+        cx, cy, cz = (
+            self.pose.position[0],
+            self.pose.position[1],
+            self.pose.position[2],
+        )
         M = N_FOLLOW + 1
-        # center is either waypoint or current pose
-        cx = self.waypoint.x if self.waypoint else self.pose.position[0]
-        cy = self.waypoint.y if self.waypoint else self.pose.position[1]
-        cz = self.waypoint.z if self.waypoint else self.pose.position[2]
-
-        # get raw 2D positions (leader + followers)
         pts2d = compute_formation_positions(cx, cy, self.formation, self.spacing, M)
-
-        # Apply rotation in 3D about leader center:
+        # اعمال چرخش سه‌بعدی مثل قبل
         rx, ry, rz = self.rotation_angles
         sx, cx1 = math.sin(rx), math.cos(rx)
         sy, cy1 = math.sin(ry), math.cos(ry)
         sz, cz1 = math.sin(rz), math.cos(rz)
-
         pts = []
         for (xi, yi) in pts2d:
-            # local vector from center
-            dx0 = xi - cx
-            dy0 = yi - cy
-            dz0 = 0.0
+            dx0, dy0, dz0 = xi - cx, yi - cy, 0.0
             # Rx
             x1, y1, z1 = dx0, cx1*dy0 - sx*dz0, sx*dy0 + cx1*dz0
             # Ry
             x2, y2, z2 = cy1*x1 + sy*z1, y1, -sy*x1 + cy1*z1
             # Rz
             x3, y3, z3 = cz1*x2 - sz*y2, sz*x2 + cz1*y2, z2
-            pts.append([cx + x3, cy + y3, cz + z3])
+            pts.append((cx + x3, cy + y3, cz + z3))
 
-        # 3) compute distances from current positions → each target
-        dists = []
-        # i=0 is leader
-        xL, yL = self.pose.position[0], self.pose.position[1]
-        for i, (xt, yt, zt) in enumerate(pts):
-            if i == 0:
-                d = math.hypot(xt - xL, yt - yL)
-            else:
-                fx, fy = self.followers.get(i-1, (xL, yL))
-                d = math.hypot(xt - fx, yt - fy)
-            dists.append(d)
-
-        # 4) determine travel_time so everyone arrives together
-        desired_speed = self.spacing
-        max_dist = max(dists) if dists else 0.0
-        travel_time = max_dist / desired_speed if desired_speed > 1e-6 else 0.0
+        # تعیین زمان رسیدن همه (travel_time)
+        dists = [math.hypot(px-cx, py-cy) for (px,py,_) in pts]
+        # اگر manual_active، اجازه بده فالورها سریع از پس حرکت بربیایند:
+        if manual_active:
+            travel_time = 1.0    # یا عدد دلخواه مثلاً 0.5s
+        else:
+            desired_speed = self.spacing
+            maxd = max(dists) if dists else 0.0
+            travel_time = (maxd/desired_speed) if desired_speed>1e-6 else 0.0
         t_arrival = now + travel_time
 
-        # 5) publish "follower_targets" (only followers, idx=0..N_FOLLOW-1)
+        # ساخت و پابلیش follower_targets
         parts = []
         for i in range(1, M):
             xi, yi, zi = pts[i]
             parts.append(f"{i-1},{xi:.2f},{yi:.2f},{zi:.2f},{t_arrival:.3f}")
         self.target_pub.publish(String(data=";".join(parts)))
 
-        # 6) Leader sets its own TrajectorySetpoint to move in sync
-        rem = t_arrival - now
-        # Feed‐forward velocity
-        vx_ff = (pts[0][0] - xL) / rem if rem > MIN_HORIZ_DELAY else 0.0
-        vy_ff = (pts[0][1] - yL) / rem if rem > MIN_HORIZ_DELAY else 0.0
-        # P‐term
-        vx_p = KP_POS * (pts[0][0] - xL)
-        vy_p = KP_POS * (pts[0][1] - yL)
-        vz_ff = (pts[0][2] - self.pose.position[2]) / rem if rem > MIN_HORIZ_DELAY else 0.0
-        vz_p = KP_POS * (pts[0][2] - self.pose.position[2])
-
-        vx = vx_ff + vx_p
-        vy = vy_ff + vy_p
-        vz = vz_ff + vz_p
-
-        # publish leader setpoint
+        # --- ۴) ساخت TrajectorySetpoint برای خودِ لیدر ---
         sp = TrajectorySetpoint()
         sp.timestamp = ts
-        # we can publish either the *current* position with velocity,
-        # or directly the target position – here we keep current pos
-        sp.position = [
-            float(self.pose.position[0]),
-            float(self.pose.position[1]),
-            float(self.pose.position[2]),
-        ]
-        sp.velocity = [float(vx), float(vy), float(vz)]
-        # apply yaw rotation
-        base_yaw = quaternion_to_yaw(self.pose.q)
-        sp.yaw = base_yaw + self.rotation_angles[2]
+        sp.position = [float(cx), float(cy), float(cz)]
 
-        self.traj_pub.publish(sp)
+        if manual_active:
+            sp.velocity = [float(vx_cmd), float(vy_cmd), float(vz_cmd)]
+            sp.yaw      = float(quaternion_to_yaw(self.pose.q))
+            self.traj_pub.publish(sp)
 
-        # Done control loop
+        else:
+            # 2) FORMATION computation
+            #   M = N_FOLLOW + 1 (leader + followers)
+            M = N_FOLLOW + 1
+            # center is either waypoint or current pose
+            cx = self.waypoint.x if self.waypoint else self.pose.position[0]
+            cy = self.waypoint.y if self.waypoint else self.pose.position[1]
+            cz = self.waypoint.z if self.waypoint else self.pose.position[2]
+
+            # get raw 2D positions (leader + followers)
+            pts2d = compute_formation_positions(cx, cy, self.formation, self.spacing, M)
+
+            # Apply rotation in 3D about leader center:
+            rx, ry, rz = self.rotation_angles
+            sx, cx1 = math.sin(rx), math.cos(rx)
+            sy, cy1 = math.sin(ry), math.cos(ry)
+            sz, cz1 = math.sin(rz), math.cos(rz)
+
+            pts = []
+            for (xi, yi) in pts2d:
+                # local vector from center
+                dx0 = xi - cx
+                dy0 = yi - cy
+                dz0 = 0.0
+                # Rx
+                x1, y1, z1 = dx0, cx1*dy0 - sx*dz0, sx*dy0 + cx1*dz0
+                # Ry
+                x2, y2, z2 = cy1*x1 + sy*z1, y1, -sy*x1 + cy1*z1
+                # Rz
+                x3, y3, z3 = cz1*x2 - sz*y2, sz*x2 + cz1*y2, z2
+                pts.append([cx + x3, cy + y3, cz + z3])
+
+            # 3) compute distances from current positions → each target
+            dists = []
+            # i=0 is leader
+            xL, yL = self.pose.position[0], self.pose.position[1]
+            for i, (xt, yt, zt) in enumerate(pts):
+                if i == 0:
+                    d = math.hypot(xt - xL, yt - yL)
+                else:
+                    pos = self.followers.get(i-1, (xL, yL))
+                    fx, fy = pos[0], pos[1]    
+                    d = math.hypot(xt - fx, yt - fy)
+                dists.append(d)
+
+            # 4) determine travel_time so everyone arrives together
+            desired_speed = self.spacing
+            max_dist = max(dists) if dists else 0.0
+            travel_time = max_dist / desired_speed if desired_speed > 1e-6 else 0.0
+            t_arrival = now + travel_time
+
+            # 5) publish "follower_targets" (only followers, idx=0..N_FOLLOW-1)
+            parts = []
+            for i in range(1, M):
+                xi, yi, zi = pts[i]
+                parts.append(f"{i-1},{xi:.2f},{yi:.2f},{zi:.2f},{t_arrival:.3f}")
+            self.target_pub.publish(String(data=";".join(parts)))
+
+            # 6) Leader moves in sync with PD‑control to reduce oscillations
+            rem = t_arrival - now
+
+            # موقعیت فعلی لیدر
+            xL, yL, zL = self.pose.position
+
+            # هدف لیدر (pts[0])
+            xt_L, yt_L, zt_L = pts[0]
+
+            # Feed‑forward base velocity
+            if rem > MIN_HORIZ_DELAY:
+                vff_x = (xt_L - xL) / rem
+                vff_y = (yt_L - yL) / rem
+                vff_z = (zt_L - zL) / rem
+            else:
+                vff_x = vff_y = vff_z = 0.0
+
+            # P‑term: خطای موقعیت
+            err_x = xt_L - xL
+            err_y = yt_L - yL
+            err_z = zt_L - zL
+
+            # D‑term: مشتق خطا
+            if self.prev_time is None:
+                # بار اول مشتق نداریم
+                derr_x = derr_y = derr_z = 0.0
+                dt = rem
+            else:
+                dt = now - self.prev_time
+                dt = max(dt, 1e-6)
+                prev_ex, prev_ey, prev_ez = self.prev_error
+                derr_x = (err_x - prev_ex) / dt
+                derr_y = (err_y - prev_ey) / dt
+                derr_z = (err_z - prev_ez) / dt
+
+            # ترکیب PD + FF
+            vx = vff_x + KP_POS * err_x + KD_POS * derr_x
+            vy = vff_y + KP_POS * err_y + KD_POS * derr_y
+            vz = vff_z + KP_POS * err_z + KD_POS * derr_z
+
+            # ذخیره خطا و زمان برای دوره بعد
+            self.prev_error = (err_x, err_y, err_z)
+            self.prev_time = now
+
+            # ساخت و ارسال TrajectorySetpoint
+            sp = TrajectorySetpoint()
+            sp.timestamp = ts
+            # موقعیت فعلی یا هدف
+            sp.position = [float(xL), float(yL), float(zL)]
+            sp.velocity = [float(vx), float(vy), float(vz)]
+            sp.yaw = quaternion_to_yaw(self.pose.q) + self.rotation_angles[2]
+            self.traj_pub.publish(sp)

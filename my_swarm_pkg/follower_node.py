@@ -19,6 +19,10 @@ from my_swarm_pkg.constants import *
 
 # محدودیت‌های هوریزنتال و عمودی
 MAX_VZ = 0.5
+MIN_VZ   = -1.0      # سرعت نزولی (همیشه منفی، مثلا -1.0 تا -1.2)
+SAFE_ALT = 1.0       # متر هدف
+TAKEOFF_THRESHOLD = 1.8    # برگشت به فرمیشن
+KP_POS = 1.2         # گین کنترل تناسبی ارتفاع (بسته به سیستم تو)
 MIN_HORIZ_DELAY = 0.3  # تاخیر کوچک قبل از حرکت افقی [s]
 
 def quaternion_to_yaw(q):
@@ -46,6 +50,7 @@ class FollowerController(Node):
         self.odom = None
         self.armed = False
         self.arrived = False
+        self.takeoff_completed = False
 
         # همسایه‌ها و Repulsion
         self.neighbors = {}
@@ -134,6 +139,7 @@ class FollowerController(Node):
         c.from_external = True
         self.cmd_pub.publish(c)
 
+
     def control_loop(self):
         # نیاز به دسترسی به لیدر و اُدم
         if not (self.leader and self.odom):
@@ -169,8 +175,28 @@ class FollowerController(Node):
             sp.velocity = [0.0, 0.0, float(vz)]
             sp.yaw = quaternion_to_yaw(self.odom.q)
             self.traj_pub.publish(sp)
+        
+    # --- فاز ۱: ARM و OFFBOARD ---
+        if not self.armed:
+            self.mode_pub.publish(
+                OffboardControlMode(
+                    timestamp=ts,
+                    position=False,
+                    velocity=True,
+                    acceleration=False,
+                    attitude=False,
+                    body_rate=False,
+                )
+            )
+            z0 = self.odom.position[2]
+            vz_cmd = max(MIN_VZ, -abs(KP_POS * (SAFE_ALT - z0)))
+            sp = TrajectorySetpoint()
+            sp.timestamp = ts
+            sp.position = [0.0, 0.0, 0.0]
+            sp.velocity = [0.0, 0.0, float(vz_cmd)]
+            sp.yaw = quaternion_to_yaw(self.odom.q)
+            self.traj_pub.publish(sp)
 
-            # آرمیگ پس از ۱ ثانیه
             self.arm_wait_counter += 1
             if self.arm_wait_counter > int(RATE_HZ * 1.0):
                 self.get_logger().info(f"Arming follower {self.idx}")
@@ -179,11 +205,11 @@ class FollowerController(Node):
                 self.armed = True
             return
 
-        # فاز ۲: پس از آرمیگ، تا دریافت Formation صبر کن
+        # --- فاز ۳: دریافت formation target ---
         if not self.target_received:
-            # حین انتظار، Offboard Position را ارسال کن تا PX4 در offboard نماند
             self.mode_pub.publish(OffboardControlMode(timestamp=ts, position=True))
             return
+
 
         # فاز ۳: کنترل Formation (XY و Z)
         # ارسال Offboard Position

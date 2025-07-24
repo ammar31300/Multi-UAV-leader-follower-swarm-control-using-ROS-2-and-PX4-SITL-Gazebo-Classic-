@@ -15,7 +15,7 @@ setup(
         'setuptools',
         'rclpy',
         'std_msgs',
-        'px4_msgs'
+        'px4_msgs',
         'px4_ros_com'
 
     ],
@@ -31,6 +31,8 @@ setup(
             'leader_follower = my_swarm_pkg.leader_follower:main',
             'main = my_swarm_pkg.main:main',
             'constants = my_swarm_pkg.constants:main',
+            'leader_manual = my_swarm_pkg.leader_manual:main',
+
         ],
     },
 )
