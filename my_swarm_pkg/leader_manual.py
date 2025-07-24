@@ -5,7 +5,8 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, Vector3
 from std_msgs.msg import String
-
+from rclpy.qos import QoSProfile, DurabilityPolicy
+from my_swarm_pkg.constants import *
 # اگر می‌خواهید با pygame کلیدها را بخوانید:
 import pygame
 
@@ -14,8 +15,9 @@ class LeaderManual(Node):
         super().__init__('leader_manual')
         # Publishers
         self.cmd_pub = self.create_publisher(Twist, '/swarm/leader_cmd', 10)
-        self.form_pub = self.create_publisher(String, '/swarm/formation_cmd', 10)
+        self.form_pub = self.create_publisher(String, '/swarm/formation_cmd', formation_qos)
         self.rot_pub = self.create_publisher(Vector3, '/swarm/rotation_cmd', 10)
+        self.spacing = 4.0  # مقدار دلخواه (مثلا ۲ متر)
 
         # تنظیم pygame برای خواندن صفحه‌کلید
         pygame.init()
@@ -51,15 +53,28 @@ class LeaderManual(Node):
                     self.vz = 1.0
                 elif event.key == pygame.K_PAGEDOWN or event.key == pygame.K_f:
                     self.vz = -1.0
-                
+                elif event.key == pygame.K_EQUALS or event.key == pygame.K_KP_PLUS:  # + key
+                    self.spacing += 0.5
+                    print(f"Spacing increased: {self.spacing}")
+                elif event.key == pygame.K_MINUS or event.key == pygame.K_KP_MINUS:  # - key
+                    self.spacing = max(0.5, self.spacing - 0.5)
+                    print(f"Spacing decreased: {self.spacing}")
                 
                 # تغییر فرمیشن
                 elif event.key == pygame.K_l:
-                    self.form_pub.publish(String(data='line'))
+                    data = f"line,{self.spacing}"
+                    self.form_pub.publish(String(data=data))
+                    self.get_logger().info(f"[Man] published form_cmd → {data}")
+
                 elif event.key == pygame.K_s:
-                    self.form_pub.publish(String(data='square'))
+                    data = f"square,{self.spacing}"
+                    self.form_pub.publish(String(data=data))
+                    self.get_logger().info(f"[Man] published form_cmd → {data}")
+
                 elif event.key == pygame.K_t:
-                    self.form_pub.publish(String(data='triangle'))
+                    data = f"triangle,{self.spacing}"
+                    self.form_pub.publish(String(data=data))
+                    self.get_logger().info(f"[Man] published form_cmd → {data}")
 
                 # چرخش (yaw) یا roll/pitch
                 elif event.key == pygame.K_w:  # چرخش مثبت
