@@ -64,5 +64,17 @@ def generate_launch_description():
             )]
         )
     )
-
+    ld.add_action(
+        TimerAction(
+            period=17.0,
+            actions=[ExecuteProcess(
+                cmd=[
+                    'gnome-terminal', '--', 'bash', '-c',
+                    "source ~/swarm_ws/install/setup.bash; \
+                     ros2 topic pub /swarm/waypoint_cmd geometry_msgs/Point '{ x: 0.0, y: 0.0, z: -2.0 }'"
+                ],
+                output='screen'
+            )]
+        )
+    )
     return ld
