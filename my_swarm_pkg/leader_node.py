@@ -258,6 +258,18 @@ class LeaderController(Node):
             vz_cmd = self.cmd_vel.linear.z
             if abs(vx_cmd) > 1e-3 or abs(vy_cmd) > 1e-3 or abs(vz_cmd) > 1e-3:
                 manual_active = True
+        
+        # --- NEW: Reset waypoint after manual control released ---
+        if not manual_active and self.cmd_vel:
+            # Only reset if previously manual was active
+            if hasattr(self, "_was_manual_active") and self._was_manual_active:
+                self.waypoint = Point(
+                    x=self.pose.position[0],
+                    y=self.pose.position[1],
+                    z=self.pose.position[2]
+                )
+                self.took_off = True
+        self._was_manual_active = manual_active
 
         # --- ۳) محاسبه موقعیت‌های Formation (برای فالورها) ---
         # مرکز Formation = موقعیت فعلی لیدر
