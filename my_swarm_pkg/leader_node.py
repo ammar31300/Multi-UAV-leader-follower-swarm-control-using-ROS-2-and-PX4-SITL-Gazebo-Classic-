@@ -7,11 +7,13 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
 MIN_HORIZ_DELAY = 0.3   # ثانیه
-
+import time
 from geometry_msgs.msg import Twist, Point, Vector3
 from std_msgs.msg import String
 from px4_msgs.msg import VehicleOdometry, OffboardControlMode, TrajectorySetpoint, VehicleCommand
 from my_swarm_pkg.constants import *
+from std_msgs.msg import String as StringMsg,Empty
+
 
 def quaternion_to_yaw(q):
     return math.atan2(
@@ -67,6 +69,11 @@ def compute_formation_positions(cx, cy, formation, spacing, M):
         # again, leader at first entry
         cells.sort(key=lambda p: p[0]*p[0] + p[1]*p[1])
         offsets = cells[:M]
+    elif formation == 'column':
+        offsets = []
+        for i in range(M):
+            dy = (i - (M - 1)/2.0) * spacing
+            offsets.append((0.0, dy))
 
     else:
         # default – use OFFSETS constant (unit‐vectors) scaled by spacing
@@ -81,8 +88,22 @@ def compute_formation_positions(cx, cy, formation, spacing, M):
 
 
 class LeaderController(Node):
-    def __init__(self):
-        super().__init__(f"{LEADER_NS}_leader_controller")
+
+    def __init__(self, ns: str = None):
+        # اگر ns داده نشده، بعد از init نود مقدار namespace واقعی رو بگیر
+        if ns is None:
+            # ساخت اولیه نود با نام موقت
+            super().__init__('leader_controller')
+            ns = self.get_namespace().lstrip('/') or LEADER_NS
+            self.get_logger().info(f'Namespace auto-detected: {ns}')
+        else:
+            # ساخت نود با namespace مشخص‌شده
+            super().__init__(f"{ns}_leader_controller", namespace='/' + ns)
+
+        # حالا می‌تونی از ns استفاده کنی
+        self.ns = ns
+        self.get_logger().info(f"LeaderController node initialized with ns: {ns}")
+
 
         # --- internal state
         self.pose = None          # latest VehicleOdometry
@@ -100,6 +121,9 @@ class LeaderController(Node):
         self.rotation_angles = (0.0, 0.0, 0.0)
         self.takeoff_altitude = 2.0     # متر
         self.took_off = False
+        self._disarm_requested = False
+        self._timer_handle = self.create_timer(1.0 / RATE_HZ, self.control_loop)
+
         # --- subscriptions
         self.create_subscription(
             VehicleOdometry,
@@ -127,6 +151,14 @@ class LeaderController(Node):
                 qos_profile_sensor_data,
             )
 
+        self.create_subscription(
+            Empty,
+            '/swarm/leader_disarm',
+            self.on_disarm_request,
+            10
+        )
+
+
         # --- publishers
         prefix = f"/{LEADER_NS}/fmu/in"
         self.mode_pub = self.create_publisher(
@@ -141,7 +173,10 @@ class LeaderController(Node):
         self.target_pub = self.create_publisher(
             String, "/swarm/follower_targets", formation_qos
         )
-
+        # برای heartbeat
+        self.hb_pub = self.create_publisher(
+            String, "/swarm/leader_heartbeat", 10
+        )
         # control loop
         self.create_timer(1.0 / RATE_HZ, self.control_loop)
         self.get_logger().info("LeaderController initialized")
@@ -194,9 +229,37 @@ class LeaderController(Node):
         c.from_external    = True
         c.confirmation     = 0
         self.cmd_pub.publish(c)
+   
+    def on_disarm_request(self, msg: Empty):
+        self.get_logger().warn("Disarm requested → LAND کردن")
+        self.send_cmd(MAV_CMD_NAV_LAND)
 
+        # یک‌بار ۵ ثانیه بعد DISARM نهایی کنیم
+        disarm_timer = None
+        def _final_cb():
+            self.final_disarm()
+            # پس از نهایی‌کردن دیس‌آرم، Timer کنترل‌لوپ را لغو کن
+            self._timer_handle.cancel()
+            # دیگر ضربان قلب نده
+            self.get_logger().info("LeaderController stopping control loop and heartbeat")
+            # در نهایت، می‌توانید نود را تخریب کنید:
+            self.destroy_node()
+        # ایجاد تایمر یک‌بار اجرا
+        disarm_timer = self.create_timer(5.0, _final_cb)
+        self._disarm_requested = True
+
+
+    def final_disarm(self):
+        self.get_logger().warn("Final DISARM")
+        # ارسال COMPOENENT_ARM_DISARM با param1=0
+        self.send_cmd(MAV_CMD_COMPONENT_ARM_DISARM, 0.0)
+    
+    
     # --- main control loop
     def control_loop(self):
+        if self._disarm_requested:
+            return
+        
         if not self.pose:
             return
 
@@ -260,29 +323,41 @@ class LeaderController(Node):
                 manual_active = True
 
         # --- ۳) محاسبه موقعیت‌های Formation (برای فالورها) ---
-        # مرکز Formation = موقعیت فعلی لیدر
-        cx, cy, cz = (
-            self.pose.position[0],
-            self.pose.position[1],
-            self.pose.position[2],
-        )
-        M = N_FOLLOW + 1
-        pts2d = compute_formation_positions(cx, cy, self.formation, self.spacing, M)
-        # اعمال چرخش سه‌بعدی مثل قبل
-        rx, ry, rz = self.rotation_angles
-        sx, cx1 = math.sin(rx), math.cos(rx)
-        sy, cy1 = math.sin(ry), math.cos(ry)
-        sz, cz1 = math.sin(rz), math.cos(rz)
-        pts = []
-        for (xi, yi) in pts2d:
-            dx0, dy0, dz0 = xi - cx, yi - cy, 0.0
-            # Rx
-            x1, y1, z1 = dx0, cx1*dy0 - sx*dz0, sx*dy0 + cx1*dz0
-            # Ry
-            x2, y2, z2 = cy1*x1 + sy*z1, y1, -sy*x1 + cy1*z1
-            # Rz
-            x3, y3, z3 = cz1*x2 - sz*y2, sz*x2 + cz1*y2, z2
-            pts.append((cx + x3, cy + y3, cz + z3))
+        cx = self.pose.position[0]
+        cy = self.pose.position[1]
+        cz = self.pose.position[2]
+        M  = N_FOLLOW + 1
+
+        # اگر فرميشن ستون است → چینش در ارتفاع (Z)
+        if self.formation == 'column':
+            mid = (M - 1) / 2.0
+            pts = []
+            for i in range(M):
+                dz = (i - mid) * self.spacing
+                pts.append((cx, cy, cz + dz))
+        else:
+            # حالت‌های line/square/triangle و چرخش در ۳D
+            pts2d = compute_formation_positions(cx, cy, self.formation, self.spacing, M)
+            rx, ry, rz = self.rotation_angles
+            sx, cx1 = math.sin(rx), math.cos(rx)
+            sy, cy1 = math.sin(ry), math.cos(ry)
+            sz, cz1 = math.sin(rz), math.cos(rz)
+            pts = []
+            for (xi, yi) in pts2d:
+                dx0, dy0, dz0 = xi - cx, yi - cy, 0.0
+                # Rx
+                x1 = dx0
+                y1 = cx1*dy0 - sx*dz0
+                z1 = sx*dy0 + cx1*dz0
+                # Ry
+                x2 = cy1*x1 + sy*z1
+                y2 = y1
+                z2 = -sy*x1 + cy1*z1
+                # Rz
+                x3 = cz1*x2 - sz*y2
+                y3 = sz*x2 + cz1*y2
+                z3 = z2
+                pts.append((cx + x3, cy + y3, cz + z3))
 
         # تعیین زمان رسیدن همه (travel_time)
         dists = [math.hypot(px-cx, py-cy) for (px,py,_) in pts]
@@ -321,28 +396,37 @@ class LeaderController(Node):
             cy = self.waypoint.y if self.waypoint else self.pose.position[1]
             cz = self.waypoint.z if self.waypoint else self.pose.position[2]
 
-            # get raw 2D positions (leader + followers)
-            pts2d = compute_formation_positions(cx, cy, self.formation, self.spacing, M)
-
-            # Apply rotation in 3D about leader center:
-            rx, ry, rz = self.rotation_angles
-            sx, cx1 = math.sin(rx), math.cos(rx)
-            sy, cy1 = math.sin(ry), math.cos(ry)
-            sz, cz1 = math.sin(rz), math.cos(rz)
-
-            pts = []
-            for (xi, yi) in pts2d:
-                # local vector from center
-                dx0 = xi - cx
-                dy0 = yi - cy
-                dz0 = 0.0
-                # Rx
-                x1, y1, z1 = dx0, cx1*dy0 - sx*dz0, sx*dy0 + cx1*dz0
-                # Ry
-                x2, y2, z2 = cy1*x1 + sy*z1, y1, -sy*x1 + cy1*z1
-                # Rz
-                x3, y3, z3 = cz1*x2 - sz*y2, sz*x2 + cz1*y2, z2
-                pts.append([cx + x3, cy + y3, cz + z3])
+            # --- محاسبه ستون یا حالات ۲D مثل قبلی ---
+            if self.formation == 'column':
+                # ستون عمودی
+                mid = (M - 1) / 2.0
+                pts = []
+                for i in range(M):
+                    dz = (i - mid) * self.spacing
+                    pts.append([cx, cy, cz + dz])
+            else:
+                # line/square/triangle + چرخش ۳D
+                pts2d = compute_formation_positions(cx, cy, self.formation, self.spacing, M)
+                rx, ry, rz = self.rotation_angles
+                sx, cx1 = math.sin(rx), math.cos(rx)
+                sy, cy1 = math.sin(ry), math.cos(ry)
+                sz, cz1 = math.sin(rz), math.cos(rz)
+                pts = []
+                for (xi, yi) in pts2d:
+                    dx0, dy0, dz0 = xi - cx, yi - cy, 0.0
+                    # Rx
+                    x1 = dx0
+                    y1 = cx1*dy0 - sx*dz0
+                    z1 = sx*dy0 + cx1*dz0
+                    # Ry
+                    x2 = cy1*x1 + sy*z1
+                    y2 = y1
+                    z2 = -sy*x1 + cy1*z1
+                    # Rz
+                    x3 = cz1*x2 - sz*y2
+                    y3 = sz*x2 + cz1*y2
+                    z3 = z2
+                    pts.append([cx + x3, cy + y3, cz + z3])
 
             # 3) compute distances from current positions → each target
             dists = []
@@ -422,3 +506,7 @@ class LeaderController(Node):
             sp.velocity = [float(vx), float(vy), float(vz)]
             sp.yaw = quaternion_to_yaw(self.pose.q) + self.rotation_angles[2]
             self.traj_pub.publish(sp)
+            # ۶) ضربان → هر follower می‌فهمد لیدر هنوز زنده است
+            now = self.get_clock().now().to_msg().sec + self.get_clock().now().to_msg().nanosec*1e-9
+            self.hb_pub.publish(String(data=f"{now:.3f}"))
+        pass

@@ -5,6 +5,9 @@ import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
+import time
+import subprocess
+from std_msgs.msg import String
 
 from std_msgs.msg import String, Float32
 from geometry_msgs.msg import Point, Vector3
@@ -34,7 +37,13 @@ def quaternion_to_yaw(q):
 class FollowerController(Node):
     def __init__(self, idx, offs):
         ns = f"px4_{idx+2}"
-        super().__init__(f"{ns}_follower")
+        super().__init__(f"{ns}_follower",namespace=ns)
+
+        # keep track of which leaders have been disarmed
+        # once a drone is disarmed it will NEVER re-arm
+        self.disarmed_leaders = set()
+        # quick alias
+        self._my_idx = idx
 
         # شناسه و آفست
         self.idx = idx
@@ -44,6 +53,8 @@ class FollowerController(Node):
         self.z_target = Z_CMD
         self.t_arrival = None
         self.target_received = False
+
+
 
         # وضعیت پهپاد
         self.leader = None
@@ -56,6 +67,25 @@ class FollowerController(Node):
         self.neighbors = {}
         self.enable_repulsion = True
 
+        self.last_leader_hb = self.get_clock().now().nanoseconds / 1e9
+        self.elected = False           # آیا من خودم رو نامزد کردم؟
+        # subscriber ضربان لیدر
+        self.create_subscription(
+            String, "/swarm/leader_heartbeat", self._hb_cb, 10
+        )
+        # یک تایمر هر ۰.۵ ثانیه برای چک کردن زنده بودن لیدر
+        self.create_timer(0.5, self._check_leader)
+
+
+        # Subscribe to disarm announcements
+        # Whenever ANY leader disarms we will get an Empty
+        from std_msgs.msg import Empty
+        self.create_subscription(
+            Empty,
+            '/swarm/leader_disarm',
+            self._on_any_leader_disarm,
+            10
+        )
         # کانتر برای تأخیر پیش از آرمیگ
         self.arm_wait_counter = 0
 
@@ -87,6 +117,7 @@ class FollowerController(Node):
             String, "/swarm/follower_targets", self.target_cb, formation_qos
         )
         self.create_subscription(Point, "/swarm/waypoint_cmd", self._clear_arrival, 10)
+
 
         # publishers
         self.arrival_pub = self.create_publisher(String, "/swarm/follower_arrived", 10)
@@ -138,12 +169,142 @@ class FollowerController(Node):
         c.target_component = 1
         c.from_external = True
         self.cmd_pub.publish(c)
+    
+    def _hb_cb(self, msg: String):
+        # هر بار ضربان رسید، زمان اخیر را ذخیره کن
+        try:
+            self.last_leader_hb = float(msg.data)
+        except:
+            self.get_logger().warn("Malformed heartbeat")
 
+    def _on_any_leader_disarm(self, msg):
+        """
+        When the current leader calls disarm(), they publish
+        an Empty on /swarm/leader_disarm.  *All* followers hear it.
+        We figure out which leader namespace has just disarmed
+        (from LEADER_NS), compute its follower-index, and
+        mark that leader permanently disarmed.  It will never
+        re-arm, and it will be excluded from future elections.
+        """
+        # import the same LEADER_NS you used to subscribe to odom:
+        from my_swarm_pkg.constants import LEADER_NS
+        # LEADER_NS is e.g. 'px4_2' → strip off 'px4_' and subtract 2
+        try:
+            # follower‐idx = int( LEADER_NS.split('_')[1] ) - 2
+            dis_idx = int(LEADER_NS.split('_')[1]) - 2
+        except:
+            self.get_logger().error("Cannot parse LEADER_NS to idx")
+            return
+
+        self.get_logger().warn(
+            f">> Detected leader idx={dis_idx} DISARMED! "
+            "That drone will never re-arm."
+        )
+        self.disarmed_leaders.add(dis_idx)
+
+        # If *this* follower itself was the one disarmed,
+        # force it into permanent “no-arm” mode:
+        if dis_idx == self._my_idx:
+            self.get_logger().warn(" I am permanently disarmed.  Standing down.")
+            self.armed = False
+            # we optionally reset t_arrival/offset so we never re-enter formation
+            self.target_received = False
+# follower_node
+
+    def _check_leader(self):
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now - self.last_leader_hb <= 2.0:
+            return
+
+        # okay, the leader is dead.  We must elect a new one.
+
+        # build list of eligible follower‐idxs
+        all_idxs = list(range(N_FOLLOW))
+        elig = [i for i in all_idxs if i not in self.disarmed_leaders]
+        if not elig:
+            self.get_logger().error("No eligible followers left to elect!")
+            return
+
+        # lowest idx wins
+        winner = min(elig)
+        if self._my_idx != winner:
+            # not our turn to spawn
+            return
+        if self.elected:
+            # we already spawned once
+            return
+
+        self.get_logger().warn(
+            f"Heartbeat dead → I am next eligible idx={self._my_idx}, spawning new leader."
+        )
+
+        # build up the ROS2-launch command exactly as before:
+
+        # Namespace فالور را بگیریم؛ اگر remap نشده بود، fallback:
+        ns = self.get_namespace().lstrip('/')
+        if not ns:
+            ns = f"px4_{self.idx+2}"
+        # اطمینان از leading slash:
+        if not ns.startswith('/'):
+            ns = '/' + ns
+
+        # دستور کامل ros2 run … با --ros-args و -r
+        cmd = [
+            'ros2', 'run', 'my_swarm_pkg', 'main',   # یا اگر entry_point‌تان نام دیگریست آن را بنویسید
+            '--ros-args',
+            '-r', f'__ns:={ns}'
+        ]
+        try:
+            subprocess.Popen(cmd)
+            self.elected = True
+            self.get_logger().info(f"Spawned main in namespace '{ns}'")
+        except Exception as e:
+            self.get_logger().error(f"Fail to spawn main in ns={ns}: {e}")
 
     def control_loop(self):
+
+        # if *this* drone has previously been disarmed → do absolutely nothing
+        if self.idx in self.disarmed_leaders:
+            return
+        
         # نیاز به دسترسی به لیدر و اُدم
         if not (self.leader and self.odom):
             return
+        # --- بررسی زنده بودن لیدر ---
+        
+        
+        has_leader = self.leader is not None and (self.get_clock().now().nanoseconds/1e9 - self.last_leader_hb) < LEADER_TIMEOUT
+        if not has_leader:
+            ######################################
+            # حالت نگه‌داشت موقعیت (position hold)
+            # ارسال Offboard تا PX4 لند نکند
+            ######################################
+            ts = int(self.get_clock().now().nanoseconds / 1e3)
+            # ارسال مد موقعیت (position control)
+            self.mode_pub.publish(
+                OffboardControlMode(
+                    timestamp=ts,
+                    position=True,
+                    velocity=False,
+                    acceleration=False,
+                    attitude=False,
+                    body_rate=False,
+                )
+            )
+            # نگه‌داشتن در همان جای فعلی
+            sp = TrajectorySetpoint()
+            sp.timestamp = ts
+            sp.position = [
+                float(self.odom.position[0]),
+                float(self.odom.position[1]),
+                float(self.odom.position[2]),
+            ]
+            sp.velocity = [0.0, 0.0, 0.0]
+            sp.yaw = quaternion_to_yaw(self.odom.q)
+            self.traj_pub.publish(sp)
+            # دیگر ادامه ندهیم تا به محض election/leader جدید، از اول بیاییم تو فاز عادی
+            return
+
 
         ts = int(self.get_clock().now().nanoseconds / 1e3)
         now = self.get_clock().now().nanoseconds / 1e9

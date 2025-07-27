@@ -17,3 +17,9 @@ MIN_HORIZ_DELAY = 0.3   # ثانیه
 TAKEOFF_ALT = 2.0          # ارتفاع هدف برای Hold
 TAKEOFF_HYSTERESIS = 0.05  # برای جلوگیری از نوسان روی مرز
 KD_POS = 0.02            # <— ضریب مشتق برای PD‑کنترل
+MAV_CMD_NAV_LAND = 21
+MAV_CMD_COMPONENT_ARM_DISARM = 400
+# حداکثر زمان مجاز نبودن heartbeat رهبر (بر حسب ثانیه)
+LEADER_TIMEOUT = 2.0
+CHECK_PERIOD      = 0.5   # [s] دوره‌ی چک کردن
+HEARTBEAT_TIMEOUT = 2.0

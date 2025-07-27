@@ -4,11 +4,15 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, Vector3
-from std_msgs.msg import String
+from std_msgs.msg import String,Empty
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from my_swarm_pkg.constants import *
 # اگر می‌خواهید با pygame کلیدها را بخوانید:
 import pygame
+from std_msgs.msg import String as StringMsg
+import time
+from my_swarm_pkg.constants import *
+import subprocess
 
 class LeaderManual(Node):
     def __init__(self):
@@ -17,7 +21,31 @@ class LeaderManual(Node):
         self.cmd_pub = self.create_publisher(Twist, '/swarm/leader_cmd', 10)
         self.form_pub = self.create_publisher(String, '/swarm/formation_cmd', formation_qos)
         self.rot_pub = self.create_publisher(Vector3, '/swarm/rotation_cmd', 10)
+                # — publisher برای Disarm کردن لیدر فعلی —
+        self.disarm_pub = self.create_publisher(Empty,   '/swarm/leader_disarm', 10)
         self.spacing = 4.0  # مقدار دلخواه (مثلا ۲ متر)
+        
+                # برای تایم‌بندی ضربان
+        self.last_leader_hb = time.time()
+        self.elected = False
+        self.last_hb = time.time()
+
+        # برای دریافت زمان اجرای فرميشن
+        self.last_arrival = None
+        self.create_subscription(
+            StringMsg,
+            '/swarm/follower_targets',
+            self._targets_cb,
+            formation_qos
+        )
+        
+                # Subscriber ضربان لیدر
+        self.create_subscription(
+            String,
+            '/swarm/leader_heartbeat',
+            self._hb_cb,
+            10
+        )
 
         # تنظیم pygame برای خواندن صفحه‌کلید
         pygame.init()
@@ -33,6 +61,47 @@ class LeaderManual(Node):
 
         # timer
         self.create_timer(0.05, self.timer_callback)
+        self.create_timer(0.5, self._check_leader)
+    def _targets_cb(self, msg: StringMsg):
+        # msg.data مثل: "0,1.23,4.56,2.00,1633308.123;1, ... "
+        parts = msg.data.split(';')
+        if not parts:
+            return
+        # استخراج t_arrival از اولین follower
+        try:
+            _, _, _, _, t_s = parts[0].split(',')
+            self.last_arrival = float(t_s)
+            now = time.time()
+            eta = self.last_arrival - now
+            self.get_logger().info(f"Formation ETA ≃ {eta:.2f} s")
+        except Exception as e:
+            self.get_logger().warn(f"cannot parse arrival_time: {e}")
+    
+    def _hb_cb(self, msg: String):
+        """هر بار ضربان رسید، زمان ذخیره شود"""
+        try:
+            self.last_leader_hb = float(msg.data)
+        except:
+            self.get_logger().warn("Malformed heartbeat")
+    
+    
+    def _check_leader(self):
+        # اگر بیش از timeout از آخرین ضربان گذشت → spawn مجدد LeaderController
+        if time.time() - self.last_hb > HEARTBEAT_TIMEOUT and not self.elected:
+            self.get_logger().warn("Leader heartbeat timeout → spawning new LeaderController")
+            # پرچم رو بردار تا spawn فقط یک‌بار بشه
+            self.elected = True
+            # namespace ای که follower#0 درش قرار داره
+            ns = '/px4_2'
+            try:
+                subprocess.Popen([
+                    'ros2', 'run', 'my_swarm_pkg', 'leader_node',
+                    '--ros-args', '-r', f'__ns:={ns}'
+                ])
+                self.get_logger().info(f"Spawned LeaderController in '{ns}'")
+            except Exception as e:
+                self.get_logger().error(f"Failed to spawn: {e}")
+
 
     def timer_callback(self):
         # دریافت رویدادهای pygame
@@ -40,6 +109,13 @@ class LeaderManual(Node):
             if event.type == pygame.QUIT:
                 rclpy.shutdown()
             elif event.type == pygame.KEYDOWN:
+                # ← کلید X برای disarm لیدر فعلی
+                if event.key == pygame.K_x:
+                    self.get_logger().warn("Manual: sending DISARM to LeaderController")
+                    self.disarm_pub.publish(Empty())
+                    # آماده spawn مجدد
+                    self.elected = False
+                    continue
                 if event.key == pygame.K_UP:
                     self.vx = 1.0
                 elif event.key == pygame.K_DOWN:
@@ -60,6 +136,20 @@ class LeaderManual(Node):
                     self.spacing = max(0.5, self.spacing - 0.5)
                     print(f"Spacing decreased: {self.spacing}")
                 
+                               # ===== v: فرميشن ردیفی =====
+                if event.key == pygame.K_v:
+                    self.formation = 'line'
+                    data = f"{self.formation},{self.spacing}"
+                    self.form_pub.publish(String(data=data))
+                    self.get_logger().info(f"[Man] set formation → {data}")
+
+                # ===== b: فرميشن ستونی =====
+                # (جدید) ستونی در ارتفاع → کلید b
+                elif event.key == pygame.K_b:
+                    data = f"column,{self.spacing}"
+                    self.form_pub.publish(String(data=data))
+                    self.get_logger().info(f"[Man] set formation → {data}")
+
                 # تغییر فرمیشن
                 elif event.key == pygame.K_l:
                     data = f"line,{self.spacing}"
