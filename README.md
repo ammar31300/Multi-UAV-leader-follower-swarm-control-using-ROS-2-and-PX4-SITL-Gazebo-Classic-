@@ -130,118 +130,164 @@ source install/setup.bash
      ros2 topic pub /swarm/rotation_cmd geometry_msgs/Vector3 '{ x: 0.0, y: 0.0, z: 1.57 }'
      ```
 
----
 
-## Package Structure  
 
+## 5. Package Structure
+
+```
 my_swarm_pkg/
+├── launch/
+│   └── swarm_launch.py         # Launch file for leader + N followers
+│
+├── my_swarm_pkg/
+│   ├── constants.py            # RATE_HZ, N_FOLLOW, OFFSETS, QoS profiles, etc.
+│   ├── leader_follower.py      # (unused – embedded version)
+│   ├── follower_node.py        # Standalone FollowerController executable
+│   ├── leader_node.py          # LeaderController executable
+│   └── leader_manual.py        # Manual teleop & spawn logic
+│
 ├── package.xml
 ├── setup.py
-├── launch/
-│   └── swarm_launch.py         # Launches leader & 4 followers
-├── resource/
-│   └── my_swarm_pkg            # Marker for setup.py
-├── my_swarm_pkg/
-│   ├── constants.py            # RATE_HZ, KP_POS, OFFSETS, …
-│   ├── leader_follower.py      # LeaderController + embedded FollowerController
-│   └── follower_node.py        # Standalone FollowerController executable
-└── README.md
+└── README.md                   # Original doc (superseded by this)
+```
 
 ---
 
-## Nodes & Classes  
+## 6. Constants
 
-### 1. LeaderController (leader_follower.py)  
-- Namespace: `/px4_1`  
-- Publishes:  
-  - OffboardControlMode  
-  - TrajectorySetpoint  
-  - VehicleCommand (ARM & set mode)  
-  - `/swarm/follower_targets` (String)  
+*All constants are defined in* `constants.py` *and some at the top of follower\_node.py / leader\_node.py.*
 
-- Subscribes:  
-  - `/px4_1/fmu/out/vehicle_odometry` (VehicleOdometry)  
-  - `/swarm/leader_cmd` (Twist)  
-  - `/swarm/waypoint_cmd` (Point)  
-  - `/swarm/formation_cmd` (String)  
-  - `/swarm/rotation_cmd` (Vector3)  
-  - `/swarm/follower_arrived` (String)  
-  - `/px4_{i}/fmu/out/vehicle_odometry` for each follower  
-
-- Core loop (`20 Hz`):  
-  1. Publish offboard mode  
-  2. Move leader (P-control to waypoint or dead-reckoning)  
-  3. Compute formation offsets → apply roll/pitch/yaw rotations → build target list  
-  4. Estimate travel time & publish `/swarm/follower_targets`  
-  5. ARM & set mode once (after ~1 s)  
-
-### 2. FollowerController (follower_node.py)  
-- Namespace: `/uav2`, `/uav3`, `/uav4`, `/uav5` → translates to `/px4_2`…`/px4_5` internally  
-- Publishes:  
-  - OffboardControlMode  
-  - TrajectorySetpoint  
-  - VehicleCommand (ARM & set mode)  
-  - `/swarm/follower_arrived` (String)  
-  - `/px4_{i+2}/follower_err` (Float32)  
-
-- Subscribes:  
-  - Leader odometry `/px4_1/fmu/out/vehicle_odometry`  
-  - Own odometry `/px4_{i}/fmu/out/vehicle_odometry`  
-  - Neighbor odometries for repulsion  
-  - `/swarm/follower_targets` (String)  
-  - `/swarm/waypoint_cmd` (Point) to reset arrival flag  
-
-- Core loop (`20 Hz`):  
-  1. Publish offboard mode  
-  2. Compute feed-forward & P-control to assigned offset  
-  3. Add repulsion forces if neighbors < threshold  
-  4. Cap velocity magnitude to REPULSION_THRESHOLD  
-  5. Zero velocity & publish “arrived” once if within ARRIVAL_THRESHOLD  
-  6. Publish final TrajectorySetpoint  
-  7. ARM & set offboard once after ~1 s  
+* `RATE_HZ`: 20.0
+* `N_FOLLOW`: 4
+* `LEADER_NS`: 'px4\_1'
+* `OFFSETS`: Default unit vector offsets for formations
+* `formation_qos`: QoSProfile for String formation messages
+* `Z_CMD` / `SAFE_ALT`: 1.0
+* `ARRIVAL_THRESHOLD`: 0.2
+* `REPULSION_GAIN`: 1.0
+* `REPULSION_THRESHOLD`: 1.5
+* `HEARTBEAT_TIMEOUT`: 2.0
+* `MAX_VZ`: 0.5
+* `MIN_VZ`: -1.0
+* `TAKEOFF_THRESHOLD`: 1.8
+* `KP_POS`: 1.2
+* `MIN_HORIZ_DELAY`: 0.3
 
 ---
 
-## Topics & Message Flow  
-| Topic                                    | Msg Type                | Publisher            | Subscriber(s)         |
-|------------------------------------------|-------------------------|----------------------|-----------------------|
-| `/px4_1/fmu/out/vehicle_odometry`        | VehicleOdometry         | PX4 SITL (leader)    | Leader + all Followers |
-| `/swarm/leader_cmd`                      | geometry_msgs/Twist     | Operator / Teleop    | Leader                |
-| `/swarm/waypoint_cmd`                    | geometry_msgs/Point     | Planner / Operator   | Leader, Followers     |
-| `/swarm/formation_cmd`                   | std_msgs/String         | Operator             | Leader                |
-| `/swarm/rotation_cmd`                    | geometry_msgs/Vector3   | Operator             | Leader                |
-| `/swarm/follower_targets`                | std_msgs/String         | Leader               | Followers             |
-| `/swarm/follower_arrived`                | std_msgs/String         | Followers            | Leader                |
-| `<ns>/fmu/in/offboard_control_mode`      | OffboardControlMode     | Leader / Followers   | PX4 FMU               |
-| `<ns>/fmu/in/trajectory_setpoint`        | TrajectorySetpoint      | Leader / Followers   | PX4 FMU               |
-| `<ns>/fmu/in/vehicle_command`            | VehicleCommand          | Leader / Followers   | PX4 FMU               |
-| `/px4_{i+2}/follower_err`                | Float32                 | Followers            | Monitoring (optional) |
+## 7. Topics & Message Flow
+
+**LeaderController** publishes:
+
+* `/LEADER_NS/fmu/in/offboard_control_mode` (OffboardControlMode)
+* `/LEADER_NS/fmu/in/trajectory_setpoint` (TrajectorySetpoint)
+* `/LEADER_NS/fmu/in/vehicle_command` (VehicleCommand)
+* `/swarm/follower_targets` (String)
+* `/swarm/leader_heartbeat` (String)
+
+**LeaderController** subscribes:
+
+* `/LEADER_NS/fmu/out/vehicle_odometry` (VehicleOdometry)
+* `/swarm/leader_cmd` (Twist)
+* `/swarm/formation_cmd` (String)
+* `/swarm/waypoint_cmd` (Point)
+* `/swarm/follower_arrived` (String)
+* `/swarm/rotation_cmd` (Vector3)
+* `/px4_2..px4_{N+1}/fmu/out/vehicle_odometry` (VehicleOdometry)
+* `/swarm/leader_disarm` (Empty)
+
+**FollowerController** publishes:
+
+* `/swarm/follower_arrived` (String)
+* `/px4_{i+2}/fmu/in/offboard_control_mode` (OffboardControlMode)
+* `/px4_{i+2}/fmu/in/trajectory_setpoint` (TrajectorySetpoint)
+* `/px4_{i+2}/fmu/in/vehicle_command` (VehicleCommand)
+* `/px4_{i+2}/follower_err` (Float32)
+
+**FollowerController** subscribes:
+
+* `/swarm/leader_heartbeat` (String)
+* `/swarm/leader_disarm` (Empty)
+* `/LEADER_NS/fmu/out/vehicle_odometry` (VehicleOdometry)
+* `/px4_{i+2}/fmu/out/vehicle_odometry` (VehicleOdometry)
+* `/px4_{j+2}/fmu/out/vehicle_odometry` (VehicleOdometry)
+* `/swarm/follower_targets` (String)
+* `/swarm/waypoint_cmd` (Point)
+
+**LeaderManual** publishes:
+
+* `/swarm/leader_cmd` (Twist)
+* `/swarm/formation_cmd` (String)
+* `/swarm/rotation_cmd` (Vector3)
+* `/swarm/leader_disarm` (Empty)
+* `/swarm/mission_cmd` (String)
+
+**LeaderManual** subscribes:
+
+* `/swarm/follower_targets` (String)
+* `/swarm/leader_heartbeat` (String)
 
 ---
 
-## Tuning Parameters  
-Defined in **`constants.py`** (and top of scripts):
+## 8. Nodes, Classes & Methods
 
-python
-RATE_HZ             = 20.0        # control loop frequency (Hz)
-Z_CMD               = -1.0        # default target altitude (m)
-OFFSETS             = [(0.0,3.0), (0.0,-30.0), (-30.0,0.0)]
-N_FOLLOW            = len(OFFSETS)
-KP_POS              = 0.6         # P-gain for position controller
-ARRIVAL_THRESHOLD   = 0.2         # [m] threshold to consider “arrived”
-REPULSION_GAIN      = 1.0         # gain for inter-agent repulsion
-REPULSION_THRESHOLD = 1.5         # [m] minimum repulsion distance
-
-> **Note:** Adjust these parameters according to your UAV dynamics and desired formation size.
+\[See original document for full class and method details.]
 
 ---
 
-## References & Links  
-- ROS 2 Installation: https://docs.ros.org/en/rolling/Installation.html  
-- PX4 Development Environment: https://docs.px4.io/master/en/dev_setup/dev_env.html  
-- PX4–ROS 2 Bridge (px4_ros_com): https://github.com/PX4/px4_ros_com  
-- Gazebo Classic Installation: http://gazebosim.org/tutorials?tut=install_ubuntu&cat=install  
+## 9. Tuning Parameters
+
+* `RATE_HZ`: 20
+* `SAFE_ALT`: 1.0
+* `ARRIVAL_THRESHOLD`: 0.2
+* `REPULSION_THRESHOLD`: 1.5
+* `REPULSION_GAIN`: 1.0
+* `KP_POS`: 1.2 (followers), 0.6 (leader)
+* `KD_POS`: from constants.py
+* `MIN_VZ` / `MAX_VZ`: -1.0 to 0.5
+* `HEARTBEAT_TIMEOUT`: 2.0
+* `MIN_HORIZ_DELAY`: 0.3
 
 ---
 
-Thank you for using **my_swarm_pkg**! Feel free to raise issues or contribute on GitHub.
+## 10. Leader Election & Re-spawn Logic
+
+* Heartbeat sent by leader on `/swarm/leader_heartbeat`
+* Followers watch for loss of heartbeat
+* If timeout occurs, all followers elect the lowest index still active
+* The winner spawns a new `leader_node` via `subprocess.Popen()`
+* All nodes that receive `/swarm/leader_disarm` mark that leader as permanently inactive
+* `LeaderManual` can also spawn a new leader if it detects timeout
+
+---
+
+## 11. Formation Types & Computation
+
+Supported formations (sent via `/swarm/formation_cmd`):
+
+* `line`: UAVs aligned in x-y
+* `square`: Grid-shaped square layout
+* `triangle`: Triangular formation pattern
+* `column`: UAVs vertically stacked along z
+
+All are computed using offset vectors, spacing, and optional rotation commands (`/swarm/rotation_cmd`).
+
+---
+
+## 12. LeaderManual Keyboard Commands
+
+* Arrow keys: Move leader in x/y
+* PageUp/PageDown or `r`/`f`: vertical z motion
+* `x`: Disarm leader (triggers re-election)
+* `+` / `-`: Increase/decrease formation spacing
+* `v` / `s` / `t` / `b`: Select line/square/triangle/column formation
+* `w`, `a`, `d`: Adjust yaw and roll
+* `m`: Upload mission (waypoint string)
+
+---
+
+## 13. License & Acknowledgements
+
+Distributed under \[Your License]
+Thanks to PX4, ROS 2 community, Gazebo Classic.
+
