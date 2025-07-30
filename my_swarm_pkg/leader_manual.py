@@ -46,7 +46,10 @@ class LeaderManual(Node):
             self._hb_cb,
             10
         )
-
+        # Publisher برای ماموریت
+        self.mission_pub = self.create_publisher(
+            StringMsg, '/swarm/mission_cmd', 10
+        )
         # تنظیم pygame برای خواندن صفحه‌کلید
         pygame.init()
         self.screen = pygame.display.set_mode((200,200))
@@ -135,7 +138,19 @@ class LeaderManual(Node):
                 elif event.key == pygame.K_MINUS or event.key == pygame.K_KP_MINUS:  # - key
                     self.spacing = max(0.5, self.spacing - 0.5)
                     print(f"Spacing decreased: {self.spacing}")
-                
+
+                    
+                elif event.key == pygame.K_m:
+                    # تعریف لیست waypoint به‌صورت دلخواه
+                    # فرمت: "x1,y1,z1;x2,y2,z2;..."
+                    mission_str = (
+                        "6,0,-2;"
+                        "9,5,-8;"
+                        "4,12,-6;"
+                        "6,2,-4"
+                    )
+                    self.get_logger().info("Publishing mission_cmd → " + mission_str)
+                    self.mission_pub.publish(StringMsg(data=mission_str))
                                # ===== v: فرميشن ردیفی =====
                 if event.key == pygame.K_v:
                     self.formation = 'line'

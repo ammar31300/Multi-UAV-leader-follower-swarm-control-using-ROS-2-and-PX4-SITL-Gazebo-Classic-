@@ -104,6 +104,10 @@ class LeaderController(Node):
         self.ns = ns
         self.get_logger().info(f"LeaderController node initialized with ns: {ns}")
 
+        # ماموریت چند نقطه‌ای
+        self.mission_waypoints = []    # لیست geometry_msgs/Point
+        self._mission_idx    = 0       # اندیس نقطه فعلی
+        self._mission_active = False
 
         # --- internal state
         self.pose = None          # latest VehicleOdometry
@@ -140,7 +144,14 @@ class LeaderController(Node):
         self.create_subscription(
             Vector3, "/swarm/rotation_cmd", self.rotation_cb, 10
         )
-
+        # سابسکرایب به یک تاپیک ساده برای فرمان ماموریت:
+        self.create_subscription(
+            String,
+            '/swarm/mission_cmd',            # فرمان هدایت خودتان
+            self._mission_cmd_callback, 
+            10
+        )
+        self.get_logger().info("Subscribed to /swarm/mission_cmd for waypoint missions")
         # follower status
         for i in range(N_FOLLOW):
             ns = f"px4_{i+2}"
@@ -254,6 +265,57 @@ class LeaderController(Node):
         # ارسال COMPOENENT_ARM_DISARM با param1=0
         self.send_cmd(MAV_CMD_COMPONENT_ARM_DISARM, 0.0)
     
+
+    def _mission_cmd_callback(self, msg: String):
+        """
+        msg.data یک رشته است به شکل:
+        "x1,y1,z1; x2,y2,z2; x3,y3,z3;"
+        یعنی مختصات هر waypoint جدا شده با ';'
+        """
+        if self._mission_active:
+            self.get_logger().warn("Mission already running – ignoring new command")
+            return
+        
+        pts = []
+        for part in msg.data.split(';'):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                x_s, y_s, z_s = part.split(',')
+                p = Point()
+                p.x = float(x_s)
+                p.y = float(y_s)
+                p.z = float(z_s)
+                pts.append(p)
+            except Exception as e:
+                self.get_logger().warn(f"Malformed mission point '{part}': {e}")
+        if not pts:
+            self.get_logger().warn("Mission Cmd دریافت شد اما لیست نقاط خالی بود")
+            return
+
+        # تنظیم وضعیت ماموریت
+        self.mission_waypoints = pts
+        self._mission_idx    = 0
+        self._mission_active = True
+        self.get_logger().info(f"Mission loaded: {len(pts)} waypoints")
+        # حرکت به نقطه اول
+        self._goto_next_mission_waypoint()
+
+    def _goto_next_mission_waypoint(self):
+        """
+        از ماموریت فعلی یک نقطه انتخاب می‌کند،
+        آن را به self.waypoint می‌دهد و arrived set را
+        پاک می‌کند تا کنترل‌لوپ به آن نقطه برود.
+        """
+        wp = self.mission_waypoints[self._mission_idx]
+        self.waypoint = wp
+        self.arrived_followers.clear()
+        self.get_logger().info(
+            f"→ Mission → goto waypoint #{self._mission_idx}: "
+            f"({wp.x:.2f},{wp.y:.2f},{wp.z:.2f})"
+        )
+
     
     # --- main control loop
     def control_loop(self):
@@ -262,7 +324,33 @@ class LeaderController(Node):
         
         if not self.pose:
             return
+        
 
+        # ۱) چکِ رسیدن لیدر (و اختیاری فالورها) به waypoint فعلی
+        if self._mission_active and self.waypoint is not None:
+            # فاصله ۳ بعدی
+            dx = float(self.pose.position[0]) - self.waypoint.x
+            dy = float(self.pose.position[1]) - self.waypoint.y
+            dz = float(self.pose.position[2]) - self.waypoint.z
+            dist3d = math.sqrt(dx*dx + dy*dy + dz*dz)
+
+            # لاگ دیباگی
+            self.get_logger().info(
+                f"[Mission-CHECK] idx={self._mission_idx}  dist3d={dist3d:.2f}  "
+                f"arrived_foll={len(self.arrived_followers)}/{N_FOLLOW}"
+            )
+
+            # صرفاً بر اساس لیدر (یا اگر می‌خواهید فالورها را هم اضافه کنید شرط بعدی را هم بگذارید)
+            if dist3d < MISSION_TOLERANCE:
+                self.get_logger().info(
+                    f"[Mission] reached wp#{self._mission_idx}  → moving on"
+                )
+                self._mission_idx += 1
+                if self._mission_idx < len(self.mission_waypoints):
+                    self._goto_next_mission_waypoint()
+                else:
+                    self._mission_active = False
+                    self.get_logger().info("✅ Mission completed.")
         # timestamp و زمان فعلی
         ts = int(self.get_clock().now().nanoseconds / 1e3)
         now = self.get_clock().now().nanoseconds / 1e9
@@ -509,4 +597,9 @@ class LeaderController(Node):
             # ۶) ضربان → هر follower می‌فهمد لیدر هنوز زنده است
             now = self.get_clock().now().to_msg().sec + self.get_clock().now().to_msg().nanosec*1e-9
             self.hb_pub.publish(String(data=f"{now:.3f}"))
-        pass
+
+                # --- پس از منطق اصلی کنترل لوپ:
+        
+
+        
+    
