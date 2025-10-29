@@ -502,7 +502,7 @@ class LeaderController(Node):
             
             # اطمینان از یک حداقل زمان سفر برای جلوگیری از سرعت‌های لحظه‌ای بالا
             MIN_TRAVEL_TIME = 1.0 
-            #travel_time = (maxd / desired_speed) if desired_speed > 1e-6 else 0.0
+            travel_time = (maxd / desired_speed) if desired_speed > 1e-6 else 0.0
             travel_time = max(travel_time, MIN_TRAVEL_TIME) # حرکت حداقل نیم ثانیه طول بکشد
             
         t_arrival = now + travel_time
