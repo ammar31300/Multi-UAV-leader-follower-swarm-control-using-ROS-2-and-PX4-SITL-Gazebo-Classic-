@@ -306,70 +306,134 @@ class FollowerController(Node):
         ts = int(self.get_clock().now().nanoseconds / 1e3)
         now = self.get_clock().now().nanoseconds / 1e9
 
-        # فاز ۱: Take-off با کنترل Velocity (تا زمانی که آرمیگ نشده‌ایم)
+    # --- فاز ۱: Pre-ARM stabilization and ARM sequence ---
         if not self.armed:
-            # ارسال Offboard Mode برای Velocity
-            self.mode_pub.publish(
-                OffboardControlMode(
-                    timestamp=ts,
-                    position=False,
-                    velocity=True,
-                    acceleration=False,
-                    attitude=False,
-                    body_rate=False,
-                )
-            )
-
-            # محاسبه سرعت vz برای صعود
-            z0 = self.odom.position[2]
-            vz_p = KP_POS * (self.z_target - z0)
-            vz = max(min(vz_p, MAX_VZ), -MAX_VZ)
-
-            # انتشار Velocity Setpoint
-            sp = TrajectorySetpoint()
-            sp.timestamp = ts
-            # در مد Velocity، فیلد position نادیده گرفته می‌شود
-            sp.position = [0.0, 0.0, 0.0]
-            sp.velocity = [0.0, 0.0, float(vz)]
-            sp.yaw = quaternion_to_yaw(self.odom.q)
-            self.traj_pub.publish(sp)
-        
-    # --- فاز ۱: ARM و OFFBOARD ---
-        if not self.armed:
-            self.mode_pub.publish(
-                OffboardControlMode(
-                    timestamp=ts,
-                    position=False,
-                    velocity=True,
-                    acceleration=False,
-                    attitude=False,
-                    body_rate=False,
-                )
-            )
-            z0 = self.odom.position[2]
-            vz_cmd = max(MIN_VZ, -abs(KP_POS * (SAFE_ALT - z0)))
-            sp = TrajectorySetpoint()
-            sp.timestamp = ts
-            sp.position = [0.0, 0.0, 0.0]
-            sp.velocity = [0.0, 0.0, float(vz_cmd)]
-            sp.yaw = quaternion_to_yaw(self.odom.q)
-            self.traj_pub.publish(sp)
-
             self.arm_wait_counter += 1
-            if self.arm_wait_counter > int(RATE_HZ * 1.0):
+            
+            # Send stable position setpoints before arming for better stability
+            if self.arm_wait_counter <= PRE_ARM_SETPOINT_COUNT:
+                # Use position control mode for stability
+                self.mode_pub.publish(
+                    OffboardControlMode(
+                        timestamp=ts,
+                        position=True,
+                        velocity=False,
+                        acceleration=False,
+                        attitude=False,
+                        body_rate=False,
+                    )
+                )
+                
+                # Send stable setpoint at current position with target altitude
+                sp = TrajectorySetpoint()
+                sp.timestamp = ts
+                sp.position = [
+                    float(self.odom.position[0]),  # Stay at current X
+                    float(self.odom.position[1]),  # Stay at current Y
+                    float(TAKEOFF_ALT)             # Target takeoff altitude
+                ]
+                sp.velocity = [0.0, 0.0, 0.0]
+                sp.yaw = quaternion_to_yaw(self.odom.q)
+                self.traj_pub.publish(sp)
+                return
+            
+            # Switch to offboard mode
+            if self.arm_wait_counter == PRE_ARM_SETPOINT_COUNT + 1:
+                self.get_logger().info(f"Switching follower {self.idx} to OFFBOARD mode")
+                self.send_cmd(176, 1.0, 6.0)  # OFFBOARD mode first
+                
+            # Continue sending stable setpoints during mode transition
+            self.mode_pub.publish(
+                OffboardControlMode(
+                    timestamp=ts,
+                    position=True,
+                    velocity=False,
+                    acceleration=False,
+                    attitude=False,
+                    body_rate=False,
+                )
+            )
+            
+            sp = TrajectorySetpoint()
+            sp.timestamp = ts
+            sp.position = [
+                float(self.odom.position[0]),
+                float(self.odom.position[1]),
+                float(TAKEOFF_ALT)
+            ]
+            sp.velocity = [0.0, 0.0, 0.0]
+            sp.yaw = quaternion_to_yaw(self.odom.q)
+            self.traj_pub.publish(sp)
+            
+            # ARM after delay
+            if self.arm_wait_counter == int(RATE_HZ * ARM_DELAY_SECONDS):
                 self.get_logger().info(f"Arming follower {self.idx}")
                 self.send_cmd(400, 1.0)       # ARM
-                self.send_cmd(176, 1.0, 6.0)  # OFFBOARD
+                
+            # Mark as armed after additional delay
+            if self.arm_wait_counter > int(RATE_HZ * (ARM_DELAY_SECONDS + 0.5)):
                 self.armed = True
+                self.get_logger().info(f"Follower {self.idx} armed and ready")
             return
 
-        # --- فاز ۳: دریافت formation target ---
+        # --- فاز ۲: Initial takeoff phase (just after arming) ---
+        if self.armed and not self.takeoff_completed:
+            self.mode_pub.publish(OffboardControlMode(timestamp=ts, position=True))
+            
+            # Stay at current XY position, only ascend to safe altitude
+            current_z = self.odom.position[2]
+            target_takeoff_z = TAKEOFF_ALT
+            
+            # Safety check for takeoff altitude
+            if target_takeoff_z > MIN_SAFE_ALTITUDE:
+                target_takeoff_z = MIN_SAFE_ALTITUDE
+            elif target_takeoff_z < MAX_SAFE_ALTITUDE:
+                target_takeoff_z = MAX_SAFE_ALTITUDE
+            
+            sp = TrajectorySetpoint()
+            sp.timestamp = ts
+            sp.position = [
+                float(self.odom.position[0]),  # Hold current X
+                float(self.odom.position[1]),  # Hold current Y
+                float(target_takeoff_z)        # Ascend to takeoff altitude
+            ]
+            
+            # Controlled ascent velocity
+            z_error = abs(current_z - target_takeoff_z)
+            if current_z > target_takeoff_z:  # Need to ascend (NED frame)
+                vz = max(MIN_VZ, -0.3)  # Slow controlled ascent
+            else:
+                vz = 0.0
+                
+            sp.velocity = [0.0, 0.0, vz]
+            sp.yaw = quaternion_to_yaw(self.odom.q)
+            self.traj_pub.publish(sp)
+            
+            # Check if takeoff is complete
+            if z_error < TAKEOFF_HYSTERESIS:
+                self.takeoff_completed = True
+                self.get_logger().info(f"Follower {self.idx} takeoff completed")
+            return
+
+        # --- فاز ۳: Wait for formation target after takeoff ---
         if not self.target_received:
             self.mode_pub.publish(OffboardControlMode(timestamp=ts, position=True))
+            
+            # Hover at current position waiting for formation command
+            sp = TrajectorySetpoint()
+            sp.timestamp = ts
+            sp.position = [
+                float(self.odom.position[0]),
+                float(self.odom.position[1]),
+                float(self.odom.position[2])
+            ]
+            sp.velocity = [0.0, 0.0, 0.0]
+            sp.yaw = quaternion_to_yaw(self.odom.q)
+            self.traj_pub.publish(sp)
             return
 
 
-        # فاز ۳: کنترل Formation (XY و Z)
+        # فاز ۴: کنترل Formation (XY و Z)
         # ارسال Offboard Position
         self.mode_pub.publish(OffboardControlMode(timestamp=ts, position=True))
 

@@ -29,6 +29,11 @@ MIN_HORIZ_DELAY = 0.3   # ثانیه
 TAKEOFF_HYSTERESIS = 0.05  # برای جلوگیری از نوسان روی مرز
 SAFE_ALT = -1.5            # Safe altitude for formation operations (1.5m above ground)
 TAKEOFF_THRESHOLD = -1.8   # Threshold for considering takeoff complete (1.8m above ground)
+
+# === ARM AND OFFBOARD TIMING ===
+PRE_ARM_SETPOINT_COUNT = 50    # Number of setpoints to send before arming (50 * 0.05s = 2.5s)
+ARM_DELAY_SECONDS = 3.0        # Time to wait before arming (seconds)
+OFFBOARD_SETPOINT_COUNT = 10   # Setpoints before switching to offboard mode
 # === MAVLINK COMMANDS ===
 MAV_CMD_NAV_LAND = 21
 MAV_CMD_COMPONENT_ARM_DISARM = 400

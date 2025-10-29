@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
@@ -252,9 +253,11 @@ class LeaderController(Node):
         self.target_pub.publish(String(data=";".join(parts)))
 
         # --- آرمیگ لیدر ---
-        if not self.armed and self.arm_wait_counter > int(RATE_HZ * 1.0):
+        if not self.armed and self.arm_wait_counter > int(RATE_HZ * ARM_DELAY_SECONDS):
+            self.get_logger().info("Arming leader after proper delay")
+            self.send_cmd(176, 1.0, 6.0)   # OFFBOARD first
+            time.sleep(0.1)  # Small delay between commands
             self.send_cmd(400, 1.0)        # ARM
-            self.send_cmd(176, 1.0, 6.0)   # OFFBOARD
             self.armed = True
 
 class FollowerController(Node):
@@ -451,10 +454,11 @@ class FollowerController(Node):
         self.traj_pub.publish(sp)
 
         # آرمیگ فالور
-        if not self.armed and self.arm_wait_counter > int(RATE_HZ * 1.0):
-            self.get_logger().info(f"Arming follower {self.idx}")
+        if not self.armed and self.arm_wait_counter > int(RATE_HZ * ARM_DELAY_SECONDS):
+            self.get_logger().info(f"Arming follower {self.idx} after proper delay")
+            self.send_cmd(176, 1.0, 6.0)   # OFFBOARD first
+            time.sleep(0.1)  # Small delay between commands
             self.send_cmd(400, 1.0)        # ARM
-            self.send_cmd(176, 1.0, 6.0)   # OFFBOARD
             self.armed = True
 
 def main(args=None):

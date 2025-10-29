@@ -363,59 +363,85 @@ class LeaderController(Node):
         ts = int(self.get_clock().now().nanoseconds / 1e3)
         now = self.get_clock().now().nanoseconds / 1e9
 
-
-        # همیشه در هر چرخه Offboard(position=True) منتشر شود
-        # ۱) OffboardControlMode را هر بار بفرست
-        self.mode_pub.publish(OffboardControlMode(timestamp=ts, position=True))
-
-        # ۲) یک TrajectorySetpoint پایه بفرست تا PX4 Offboard را فعال کند
-        #    (در فاز اول می‌توانیم ارتفاع takeoff_altitude را بدهیم)
+        # Get current yaw for stability
         q = self.pose.q
         yaw_now = quaternion_to_yaw((q[0], q[1], q[2], q[3]))
-        z_sp = self.takeoff_altitude if not self.took_off else self.pose.position[2]
+
+        # Always send offboard control mode first
+        self.mode_pub.publish(OffboardControlMode(timestamp=ts, position=True))
         
-        # === ALTITUDE SAFETY CHECK FOR LEADER ===
-        if z_sp > MIN_SAFE_ALTITUDE:  # Too low (remember NED: positive is down)
-            z_sp = MIN_SAFE_ALTITUDE
-            self.get_logger().warn(f"Leader altitude too low, clamping to {abs(MIN_SAFE_ALTITUDE)}m")
-        elif z_sp < MAX_SAFE_ALTITUDE:  # Too high (remember NED: negative is up)
-            z_sp = MAX_SAFE_ALTITUDE
-            self.get_logger().warn(f"Leader altitude too high, clamping to {abs(MAX_SAFE_ALTITUDE)}m")
-        
-        sp = TrajectorySetpoint()
-        sp.timestamp  = ts
-        sp.position   = [
-            float(self.pose.position[0]),
-            float(self.pose.position[1]),
-            float(z_sp),
-        ]
-        sp.yaw        = float(yaw_now)
-        # اگر دوست دارید سرعت صفر صادر کنید:
-        sp.velocity   = [0.0, 0.0, 0.0]
-        self.traj_pub.publish(sp)
+        # Check if we need takeoff phase (right after arming)
+        if self.armed and not self.took_off:
+            current_z = self.pose.position[2]
+            z_error = abs(current_z - self.takeoff_altitude)
+            
+            # Stay at current XY position during takeoff
+            sp = TrajectorySetpoint()
+            sp.timestamp = ts
+            sp.position = [
+                float(self.pose.position[0]),  # Hold X position
+                float(self.pose.position[1]),  # Hold Y position
+                float(self.takeoff_altitude),  # Target takeoff altitude
+            ]
+            
+            # Gradual ascent with controlled velocity
+            if current_z > self.takeoff_altitude:  # Need to ascend (NED frame)
+                vz = max(MAX_ASCENT_SPEED, -0.5)  # Controlled ascent speed
+            else:
+                vz = 0.0
+            
+            sp.velocity = [0.0, 0.0, vz]  # No horizontal movement during takeoff
+            sp.yaw = float(yaw_now)
+            self.traj_pub.publish(sp)
+            
+            # Check if takeoff is complete
+            if z_error < TAKEOFF_HYSTERESIS:
+                self.took_off = True
+                self.get_logger().info("Leader takeoff completed, ready for formation control")
+            return
 
         # ۳) اگر هنوز Armed نشده‌ایم، handshake OFFBOARD → ARM
         if not self.armed:
             self.arm_wait_counter += 1
+            
+            # Send setpoints for stability before switching to offboard
+            if self.arm_wait_counter <= PRE_ARM_SETPOINT_COUNT:
+                # Send stable setpoints at current position for better transition
+                stable_sp = TrajectorySetpoint()
+                stable_sp.timestamp = ts
+                stable_sp.position = [
+                    float(self.pose.position[0]),
+                    float(self.pose.position[1]),
+                    float(self.takeoff_altitude),  # Target takeoff altitude
+                ]
+                stable_sp.velocity = [0.0, 0.0, 0.0]
+                stable_sp.yaw = float(yaw_now)
+                self.traj_pub.publish(stable_sp)
+                return
+            
             # ۳a) ارسال MAV_CMD_DO_SET_MODE برای ورود به OFFBOARD یکبار
-            if self.arm_wait_counter == 1:
+            if self.arm_wait_counter == PRE_ARM_SETPOINT_COUNT + 1:
+                self.get_logger().info("Switching leader to OFFBOARD mode")
                 self.send_cmd(
                     VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
                     1.0,    # custom mode
                     6.0     # 6 = OFFBOARD
                 )
-            # ۳b) بعد از ~1 ثانیه، فرمان ARM را بفرست
-            if self.arm_wait_counter == int(RATE_HZ * 1.0):
+            
+            # ۳b) بعد از ARM_DELAY_SECONDS ثانیه، فرمان ARM را بفرست
+            if self.arm_wait_counter == int(RATE_HZ * ARM_DELAY_SECONDS):
+                self.get_logger().info("Arming leader")
                 self.send_cmd(
                     VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
                     1.0,    # arm = 1
                     0.0
                 )
-            # ۳c) بعد از ~1.5 ثانیه، وضعیت Armed را تغییر بده و به مرحله بعد برو
-            if self.arm_wait_counter > int(RATE_HZ * 1.5):
+            
+            # ۳c) بعد از ARM_DELAY_SECONDS + 0.5 ثانیه، وضعیت Armed را تغییر بده
+            if self.arm_wait_counter > int(RATE_HZ * (ARM_DELAY_SECONDS + 0.5)):
                 self.armed = True
                 self.took_off = False
-                self.get_logger().info(">> Leader armed and in OFFBOARD")
+                self.get_logger().info(">> Leader armed and in OFFBOARD - starting takeoff")
             return
         
         # --- ۲) تعیین manual_active ---
