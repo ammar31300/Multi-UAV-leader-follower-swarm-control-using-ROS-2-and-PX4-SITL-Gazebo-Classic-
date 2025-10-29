@@ -146,8 +146,8 @@ class LeaderManual(Node):
                     mission_str = (
                         "6,0,-2;"
                         "9,5,-8;"
-                        "4,12,-6;"
-                        "6,2,-4"
+                        "-4,12,-6;"
+                        "16,2,-4"
                     )
                     self.get_logger().info("Publishing mission_cmd → " + mission_str)
                     self.mission_pub.publish(StringMsg(data=mission_str))

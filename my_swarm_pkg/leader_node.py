@@ -13,6 +13,7 @@ from std_msgs.msg import String
 from px4_msgs.msg import VehicleOdometry, OffboardControlMode, TrajectorySetpoint, VehicleCommand
 from my_swarm_pkg.constants import *
 from std_msgs.msg import String as StringMsg,Empty
+MAX_SWARM_SPEED = 1.0 # متر بر ثانیه، یک سرعت ایمن و قابل قبول
 
 
 def quaternion_to_yaw(q):
@@ -103,8 +104,13 @@ class LeaderController(Node):
         # حالا می‌تونی از ns استفاده کنی
         self.ns = ns
         self.get_logger().info(f"LeaderController node initialized with ns: {ns}")
+        
+        
+        self.manual_active     = False     # آیا تاکنون ورودی دستی گرفته‌ایم؟
+        self.manual_pos        = [0.0,0.0,0.0]      # نقطهٔ انتهایی جابجایی دستی
+        self.prev_manual_time  = None      # برای محاسبه dt در integration
+            # ماموریت چند نقطه‌ای
 
-        # ماموریت چند نقطه‌ای
         self.mission_waypoints = []    # لیست geometry_msgs/Point
         self._mission_idx    = 0       # اندیس نقطه فعلی
         self._mission_active = False
@@ -205,6 +211,7 @@ class LeaderController(Node):
         if len(parts) > 1:
             self.spacing = float(parts[1])
         self.get_logger().info(f"Formation set to {self.formation}, spacing={self.spacing}")
+        self.manual_active = False
 
     def waypoint_cb(self, msg):
         self.waypoint = msg
@@ -301,6 +308,7 @@ class LeaderController(Node):
         self.get_logger().info(f"Mission loaded: {len(pts)} waypoints")
         # حرکت به نقطه اول
         self._goto_next_mission_waypoint()
+        self.manual_active = False
 
     def _goto_next_mission_waypoint(self):
         """
@@ -355,6 +363,7 @@ class LeaderController(Node):
         ts = int(self.get_clock().now().nanoseconds / 1e3)
         now = self.get_clock().now().nanoseconds / 1e9
 
+
         # همیشه در هر چرخه Offboard(position=True) منتشر شود
         # ۱) OffboardControlMode را هر بار بفرست
         self.mode_pub.publish(OffboardControlMode(timestamp=ts, position=True))
@@ -401,8 +410,41 @@ class LeaderController(Node):
             return
         
         # --- ۲) تعیین manual_active ---
-        vx_cmd = vy_cmd = vz_cmd = 0.0
+        vx_cmd = self.cmd_vel.linear.x if self.cmd_vel else 0.0
+        vy_cmd = self.cmd_vel.linear.y if self.cmd_vel else 0.0
+        vz_cmd = self.cmd_vel.linear.z if self.cmd_vel else 0.0
         manual_active = False
+    # ===== ادغام سرعت دستی =====
+    # فقط وقتی سرعت واقعی (بزرگتر از آستانه) باشد
+        if abs(vx_cmd) > 1e-3 or abs(vy_cmd) > 1e-3 or abs(vz_cmd) > 1e-3:
+            # بار اول ورود به حالت دستی
+            if not self.manual_active:
+                self.manual_active = True
+                # مقداردهی manual_pos از آخرین waypoint یا موقعیت فعلی
+                if self.waypoint:
+                    self.manual_pos = [self.waypoint.x,
+                                    self.waypoint.y,
+                                    self.waypoint.z]
+                elif self.pose:
+                    px, py, pz = self.pose.position
+                    self.manual_pos = [px, py, pz]
+                # تنظیم زمان اولیه انتگرال‌گیری
+                self.prev_int_time = now
+
+            # محاسبه Δt
+            dt = now - (self.prev_int_time or now)
+            # محافظت در برابر مقادیر نامناسب
+            if dt <= 0.0 or dt > 1.0:
+                dt = 1.0 / RATE_HZ
+            self.prev_int_time = now
+
+            # انتگرال ساده: x += v * dt
+            self.manual_pos[0] += vx_cmd * dt
+            self.manual_pos[1] += vy_cmd * dt
+            self.manual_pos[2] += vz_cmd * dt
+
+        # اگر قبلاً وارد manual شده‌ایم، در همین شاخه بمانیم
+        manual_active = self.manual_active
         if self.cmd_vel:
             vx_cmd = self.cmd_vel.linear.x
             vy_cmd = self.cmd_vel.linear.y
@@ -451,11 +493,18 @@ class LeaderController(Node):
         dists = [math.hypot(px-cx, py-cy) for (px,py,_) in pts]
         # اگر manual_active، اجازه بده فالورها سریع از پس حرکت بربیایند:
         if manual_active:
-            travel_time = 1.0    # یا عدد دلخواه مثلاً 0.5s
+            travel_time = 1.0    # زمان پاسخ سریع برای کنترل دستی
         else:
-            desired_speed = self.spacing
+            # از سرعت حداکثری که در بالا تعریف کردیم استفاده می‌کنیم
+            desired_speed = MAX_SWARM_SPEED
+
             maxd = max(dists) if dists else 0.0
-            travel_time = (maxd/desired_speed) if desired_speed>1e-6 else 0.0
+            
+            # اطمینان از یک حداقل زمان سفر برای جلوگیری از سرعت‌های لحظه‌ای بالا
+            MIN_TRAVEL_TIME = 1.0 
+            #travel_time = (maxd / desired_speed) if desired_speed > 1e-6 else 0.0
+            travel_time = max(travel_time, MIN_TRAVEL_TIME) # حرکت حداقل نیم ثانیه طول بکشد
+            
         t_arrival = now + travel_time
 
         # ساخت و پابلیش follower_targets
@@ -480,10 +529,9 @@ class LeaderController(Node):
             #   M = N_FOLLOW + 1 (leader + followers)
             M = N_FOLLOW + 1
             # center is either waypoint or current pose
-            cx = self.waypoint.x if self.waypoint else self.pose.position[0]
-            cy = self.waypoint.y if self.waypoint else self.pose.position[1]
-            cz = self.waypoint.z if self.waypoint else self.pose.position[2]
-
+            cx = self.pose.position[0]
+            cy = self.pose.position[1]
+            cz = self.pose.position[2]
             # --- محاسبه ستون یا حالات ۲D مثل قبلی ---
             if self.formation == 'column':
                 # ستون عمودی
@@ -578,17 +626,33 @@ class LeaderController(Node):
                 derr_z = (err_z - prev_ez) / dt
 
             # ترکیب PD + FF
+            # ترکیب PD + FF
             vx = vff_x + KP_POS * err_x + KD_POS * derr_x
             vy = vff_y + KP_POS * err_y + KD_POS * derr_y
             vz = vff_z + KP_POS * err_z + KD_POS * derr_z
+            if vz < 0:  # اگر در حال صعود هستیم (vz منفی است)
+                vz = max(vz, MAX_ASCENT_SPEED)  # استفاده از سقف سرعت صعود
+            else:  # اگر در حال فرود هستیم (vz مثبت است)
+                vz = min(vz, MAX_DESCENT_SPEED) # استفاده از سقف سرعت فرود
+                        # <<<--- شروع بخش اصلاح شده برای محدود کردن سرعت لیدر --->>>
+                        # محدود کردن سرعت افقی لیدر
+            h_speed = math.sqrt(vx**2 + vy**2)
+            if h_speed > MAX_LEADER_SPEED:
+                scale = MAX_LEADER_SPEED / h_speed
+                vx *= scale
+                vy *= scale
+
+            # محدود کردن سرعت عمودی با مقادیر نامتقارن
+            vz = max(vz, MAX_ASCENT_SPEED)   # اعمال سقف سرعت صعود
+            vz = min(vz, MAX_DESCENT_SPEED)  # اعمال سقف سرعت فرود
+            # <<<--- پایان بخش اصلاح شده --->>>
 
             # ذخیره خطا و زمان برای دوره بعد
             self.prev_error = (err_x, err_y, err_z)
             self.prev_time = now
 
-            # ساخت و ارسال TrajectorySetpoint
+            # ساخت TrajectorySetpoint برای لیدر
             sp = TrajectorySetpoint()
-            sp.timestamp = ts
             # موقعیت فعلی یا هدف
             sp.position = [float(xL), float(yL), float(zL)]
             sp.velocity = [float(vx), float(vy), float(vz)]
