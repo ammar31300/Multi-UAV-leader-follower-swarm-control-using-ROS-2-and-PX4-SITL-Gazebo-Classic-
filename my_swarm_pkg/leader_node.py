@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # swarm_package/leader_controller.py
 
@@ -128,6 +127,15 @@ class LeaderController(Node):
         self._disarm_requested = False
         self._timer_handle = self.create_timer(1.0 / RATE_HZ, self.control_loop)
 
+        # Orbital rotation state
+        self.orbital_rotation_active = False
+        self.orbital_center = [0.0, 0.0, 0.0]  # center point of rotation
+        self.orbital_radius = 5.0  # radius of orbital rotation
+        self.orbital_angular_velocity = 0.2  # rad/s
+        self.orbital_start_time = None
+        self.orbital_duration = 0.0  # duration in seconds, 0 = infinite
+        self.orbital_start_angles = {}  # initial angles for each drone
+
         # --- subscriptions
         self.create_subscription(
             VehicleOdometry,
@@ -143,6 +151,10 @@ class LeaderController(Node):
         self.create_subscription(String, "/swarm/follower_arrived", self.arrived_cb, 10)
         self.create_subscription(
             Vector3, "/swarm/rotation_cmd", self.rotation_cb, 10
+        )
+        # Subscribe to orbital rotation command
+        self.create_subscription(
+            Vector3, "/swarm/orbital_cmd", self.orbital_cb, 10
         )
         # سابسکرایب به یک تاپیک ساده برای فرمان ماموریت:
         self.create_subscription(
@@ -219,6 +231,140 @@ class LeaderController(Node):
         # x=roll, y=pitch, z=yaw in radians
         self.rotation_angles = (msg.x, msg.y, msg.z)
         self.get_logger().info(f"Rotation set to (r,p,y)=({msg.x:.2f},{msg.y:.2f},{msg.z:.2f})")
+
+    def orbital_cb(self, msg):
+        """
+        Handle orbital rotation command.
+        msg.x = radius (meters)
+        msg.y = angular velocity (rad/s) 
+        msg.z = duration (seconds, 0 = infinite)
+        """
+        if msg.x <= 0:
+            # Stop orbital rotation
+            self.orbital_rotation_active = False
+            self.get_logger().info("Orbital rotation stopped")
+            return
+            
+        # Calculate center point as center of all drones
+        all_positions = []
+        
+        # Add leader position
+        if self.pose:
+            all_positions.append([self.pose.position[0], self.pose.position[1], self.pose.position[2]])
+        
+        # Add follower positions
+        for i in range(len(self.followers)):
+            if i in self.followers:
+                pos = self.followers[i]
+                all_positions.append([pos[0], pos[1], pos[2]])
+        
+        if len(all_positions) > 0:
+            # Calculate center
+            center_x = sum(pos[0] for pos in all_positions) / len(all_positions)
+            center_y = sum(pos[1] for pos in all_positions) / len(all_positions)
+            center_z = sum(pos[2] for pos in all_positions) / len(all_positions)
+            
+            self.orbital_center = [center_x, center_y, center_z]
+            self.orbital_radius = float(msg.x)
+            self.orbital_angular_velocity = float(msg.y)
+            self.orbital_start_time = self.get_clock().now().nanoseconds / 1e9
+            self.orbital_duration = float(msg.z) if msg.z > 0 else 0.0  # 0 means infinite
+            
+            # Calculate initial angles for each drone
+            self.orbital_start_angles = {}
+            
+            # Leader angle
+            if self.pose:
+                dx = self.pose.position[0] - center_x
+                dy = self.pose.position[1] - center_y
+                angle = math.atan2(dy, dx)
+                self.orbital_start_angles['leader'] = angle
+            
+            # Follower angles
+            for i in range(len(self.followers)):
+                if i in self.followers:
+                    pos = self.followers[i]
+                    dx = pos[0] - center_x
+                    dy = pos[1] - center_y
+                    angle = math.atan2(dy, dx)
+                    self.orbital_start_angles[i] = angle
+            
+            self.orbital_rotation_active = True
+            
+            duration_str = f"{self.orbital_duration:.1f}s" if self.orbital_duration > 0 else "infinite"
+            self.get_logger().info(f"Orbital rotation started: center=({center_x:.2f},{center_y:.2f},{center_z:.2f}), "
+                                 f"radius={self.orbital_radius:.2f}m, angular_vel={self.orbital_angular_velocity:.2f}rad/s, "
+                                 f"duration={duration_str}")
+        else:
+            self.get_logger().warn("Cannot start orbital rotation: no drone positions available")
+
+    def _compute_orbital_positions(self):
+        """
+        Compute orbital positions for all drones around the center point.
+        Returns list of (x, y, z) positions.
+        """
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        elapsed_time = current_time - self.orbital_start_time
+        
+        # Check if orbital rotation should stop due to duration
+        if self.orbital_duration > 0 and elapsed_time >= self.orbital_duration:
+            self.orbital_rotation_active = False
+            self.get_logger().info("Orbital rotation completed (duration expired)")
+            # Return current positions to stop smoothly
+            pts = []
+            M = N_FOLLOW + 1
+            
+            # Leader position
+            pts.append((self.pose.position[0], self.pose.position[1], self.pose.position[2]))
+            
+            # Follower positions
+            for i in range(1, M):
+                follower_idx = i - 1
+                if follower_idx in self.followers:
+                    pos = self.followers[follower_idx]
+                    pts.append((pos[0], pos[1], pos[2]))
+                else:
+                    pts.append((self.pose.position[0], self.pose.position[1], self.pose.position[2]))
+            
+            return pts
+        
+        angular_displacement = self.orbital_angular_velocity * elapsed_time
+        
+        pts = []
+        M = N_FOLLOW + 1
+        
+        # Leader position
+        if 'leader' in self.orbital_start_angles:
+            start_angle = self.orbital_start_angles['leader']
+            current_angle = start_angle + angular_displacement
+            x = self.orbital_center[0] + self.orbital_radius * math.cos(current_angle)
+            y = self.orbital_center[1] + self.orbital_radius * math.sin(current_angle)
+            z = self.orbital_center[2]  # Keep same altitude
+            pts.append((x, y, z))
+        else:
+            # Fallback to current position if no start angle
+            pts.append((self.pose.position[0], self.pose.position[1], self.pose.position[2]))
+        
+        # Follower positions
+        for i in range(1, M):
+            follower_idx = i - 1
+            if follower_idx in self.orbital_start_angles:
+                start_angle = self.orbital_start_angles[follower_idx]
+                current_angle = start_angle + angular_displacement
+                x = self.orbital_center[0] + self.orbital_radius * math.cos(current_angle)
+                y = self.orbital_center[1] + self.orbital_radius * math.sin(current_angle)
+                z = self.orbital_center[2]  # Keep same altitude
+                pts.append((x, y, z))
+            else:
+                # Fallback to current formation position if no start angle
+                if follower_idx in self.followers:
+                    pos = self.followers[follower_idx]
+                    pts.append((pos[0], pos[1], pos[2]))
+                else:
+                    # Default position if follower not available
+                    pts.append((self.orbital_center[0], self.orbital_center[1], self.orbital_center[2]))
+        
+        return pts
 
     def _follower_status_cb(self, idx, msg):
         p = msg.position
@@ -416,36 +562,40 @@ class LeaderController(Node):
         cz = self.pose.position[2]
         M  = N_FOLLOW + 1
 
-        # اگر فرميشن ستون است → چینش در ارتفاع (Z)
-        if self.formation == 'column':
-            mid = (M - 1) / 2.0
-            pts = []
-            for i in range(M):
-                dz = (i - mid) * self.spacing
-                pts.append((cx, cy, cz + dz))
+        # Check if orbital rotation is active
+        if self.orbital_rotation_active:
+            pts = self._compute_orbital_positions()
         else:
-            # حالت‌های line/square/triangle و چرخش در ۳D
-            pts2d = compute_formation_positions(cx, cy, self.formation, self.spacing, M)
-            rx, ry, rz = self.rotation_angles
-            sx, cx1 = math.sin(rx), math.cos(rx)
-            sy, cy1 = math.sin(ry), math.cos(ry)
-            sz, cz1 = math.sin(rz), math.cos(rz)
-            pts = []
-            for (xi, yi) in pts2d:
-                dx0, dy0, dz0 = xi - cx, yi - cy, 0.0
-                # Rx
-                x1 = dx0
-                y1 = cx1*dy0 - sx*dz0
-                z1 = sx*dy0 + cx1*dz0
-                # Ry
-                x2 = cy1*x1 + sy*z1
-                y2 = y1
-                z2 = -sy*x1 + cy1*z1
-                # Rz
-                x3 = cz1*x2 - sz*y2
-                y3 = sz*x2 + cz1*y2
-                z3 = z2
-                pts.append((cx + x3, cy + y3, cz + z3))
+            # اگر فرميشن ستون است → چینش در ارتفاع (Z)
+            if self.formation == 'column':
+                mid = (M - 1) / 2.0
+                pts = []
+                for i in range(M):
+                    dz = (i - mid) * self.spacing
+                    pts.append((cx, cy, cz + dz))
+            else:
+                # حالت‌های line/square/triangle و چرخش در ۳D
+                pts2d = compute_formation_positions(cx, cy, self.formation, self.spacing, M)
+                rx, ry, rz = self.rotation_angles
+                sx, cx1 = math.sin(rx), math.cos(rx)
+                sy, cy1 = math.sin(ry), math.cos(ry)
+                sz, cz1 = math.sin(rz), math.cos(rz)
+                pts = []
+                for (xi, yi) in pts2d:
+                    dx0, dy0, dz0 = xi - cx, yi - cy, 0.0
+                    # Rx
+                    x1 = dx0
+                    y1 = cx1*dy0 - sx*dz0
+                    z1 = sx*dy0 + cx1*dz0
+                    # Ry
+                    x2 = cy1*x1 + sy*z1
+                    y2 = y1
+                    z2 = -sy*x1 + cy1*z1
+                    # Rz
+                    x3 = cz1*x2 - sz*y2
+                    y3 = sz*x2 + cz1*y2
+                    z3 = z2
+                    pts.append((cx + x3, cy + y3, cz + z3))
 
         # تعیین زمان رسیدن همه (travel_time)
         dists = [math.hypot(px-cx, py-cy) for (px,py,_) in pts]
@@ -484,37 +634,41 @@ class LeaderController(Node):
             cy = self.waypoint.y if self.waypoint else self.pose.position[1]
             cz = self.waypoint.z if self.waypoint else self.pose.position[2]
 
-            # --- محاسبه ستون یا حالات ۲D مثل قبلی ---
-            if self.formation == 'column':
-                # ستون عمودی
-                mid = (M - 1) / 2.0
-                pts = []
-                for i in range(M):
-                    dz = (i - mid) * self.spacing
-                    pts.append([cx, cy, cz + dz])
+            # Check if orbital rotation is active
+            if self.orbital_rotation_active:
+                pts = self._compute_orbital_positions()
             else:
-                # line/square/triangle + چرخش ۳D
-                pts2d = compute_formation_positions(cx, cy, self.formation, self.spacing, M)
-                rx, ry, rz = self.rotation_angles
-                sx, cx1 = math.sin(rx), math.cos(rx)
-                sy, cy1 = math.sin(ry), math.cos(ry)
-                sz, cz1 = math.sin(rz), math.cos(rz)
-                pts = []
-                for (xi, yi) in pts2d:
-                    dx0, dy0, dz0 = xi - cx, yi - cy, 0.0
-                    # Rx
-                    x1 = dx0
-                    y1 = cx1*dy0 - sx*dz0
-                    z1 = sx*dy0 + cx1*dz0
-                    # Ry
-                    x2 = cy1*x1 + sy*z1
-                    y2 = y1
-                    z2 = -sy*x1 + cy1*z1
-                    # Rz
-                    x3 = cz1*x2 - sz*y2
-                    y3 = sz*x2 + cz1*y2
-                    z3 = z2
-                    pts.append([cx + x3, cy + y3, cz + z3])
+                # --- محاسبه ستون یا حالات ۲D مثل قبلی ---
+                if self.formation == 'column':
+                    # ستون عمودی
+                    mid = (M - 1) / 2.0
+                    pts = []
+                    for i in range(M):
+                        dz = (i - mid) * self.spacing
+                        pts.append([cx, cy, cz + dz])
+                else:
+                    # line/square/triangle + چرخش ۳D
+                    pts2d = compute_formation_positions(cx, cy, self.formation, self.spacing, M)
+                    rx, ry, rz = self.rotation_angles
+                    sx, cx1 = math.sin(rx), math.cos(rx)
+                    sy, cy1 = math.sin(ry), math.cos(ry)
+                    sz, cz1 = math.sin(rz), math.cos(rz)
+                    pts = []
+                    for (xi, yi) in pts2d:
+                        dx0, dy0, dz0 = xi - cx, yi - cy, 0.0
+                        # Rx
+                        x1 = dx0
+                        y1 = cx1*dy0 - sx*dz0
+                        z1 = sx*dy0 + cx1*dz0
+                        # Ry
+                        x2 = cy1*x1 + sy*z1
+                        y2 = y1
+                        z2 = -sy*x1 + cy1*z1
+                        # Rz
+                        x3 = cz1*x2 - sz*y2
+                        y3 = sz*x2 + cz1*y2
+                        z3 = z2
+                        pts.append([cx + x3, cy + y3, cz + z3])
 
             # 3) compute distances from current positions → each target
             dists = []
@@ -609,7 +763,6 @@ class LeaderController(Node):
             self.hb_pub.publish(String(data=f"{now:.3f}"))
 
                 # --- پس از منطق اصلی کنترل لوپ:
-        
 
-        
-    
+
+

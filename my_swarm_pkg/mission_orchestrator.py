@@ -12,7 +12,7 @@ FORMATION = "triangle"           # نوع آرایش: "triangle" یا "square"
 FORMATION_SPACING = 5.0          # فاصله بین پهپادها در آرایش
 MOVE_DISTANCE_Y = 10.0           # فاصله حرکت در جهت Y
 MOVE_DISTANCE_X = 10.0           # فاصله حرکت در جهت X
-ROTATION_DEGREES = 400.0          # زاویه چرخش گروه (به درجه)
+ROTATION_DEGREES = 90          # زاویه چرخش گروه (به درجه)
 
 class MissionOrchestrator(Node):
     """
@@ -34,6 +34,8 @@ class MissionOrchestrator(Node):
         # --- Publishers ---
         self.waypoint_pub = self.create_publisher(Point, '/swarm/waypoint_cmd', 10)
         self.rotation_pub = self.create_publisher(Vector3, '/swarm/rotation_cmd', 10)
+        # Publisher for orbital rotation command
+        self.orbital_pub = self.create_publisher(Vector3, '/swarm/orbital_cmd', 10)
         
         # --- ناشر اصلی با QoS اصلاح شده ---
         self.formation_pub = self.create_publisher(String, '/swarm/formation_cmd', latching_qos)
@@ -69,17 +71,24 @@ class MissionOrchestrator(Node):
         self.waypoint_pub.publish(waypoint)
         time.sleep(5)
 
-        # --- مرحله ۴: چرخش ۹۰ درجه‌ای گروه ---
-        self.get_logger().info(f"مرحله ۴: چرخش گروه به اندازه {ROTATION_DEGREES} درجه.")
-        rotation_cmd = Vector3(z=math.radians(ROTATION_DEGREES))
-        self.rotation_pub.publish(rotation_cmd)
-        time.sleep(5)
+        # --- مرحله ۴: چرخش مداری گروه ---
+        self.get_logger().info(f"مرحله ۴: چرخش مداری گروه با شعاع {FORMATION_SPACING} متر.")
+        # x=radius, y=angular_velocity (rad/s), z=duration (0=infinite)
+        orbital_cmd = Vector3(x=FORMATION_SPACING, y=math.radians(45.0), z=8.0)  # 45 deg/s for 8 seconds
+        self.orbital_pub.publish(orbital_cmd)
+        time.sleep(10)  # Wait for orbital rotation to complete
 
         # --- مرحله ۵: حرکت در جهت X ---
         self.get_logger().info(f"مرحله ۵: حرکت به اندازه {MOVE_DISTANCE_X} متر در جهت X.")
         waypoint = Point(x=MOVE_DISTANCE_X, y=MOVE_DISTANCE_Y, z=TARGET_ALTITUDE)
         self.waypoint_pub.publish(waypoint)
         time.sleep(5)
+
+        # --- مرحله ۶: توقف چرخش مداری ---
+        self.get_logger().info("مرحله ۶: توقف چرخش مداری.")
+        stop_orbital_cmd = Vector3(x=0.0, y=0.0, z=0.0)  # x=0 means stop
+        self.orbital_pub.publish(stop_orbital_cmd)
+        time.sleep(2)
 
         self.get_logger().info("✅ مأموریت با موفقیت به پایان رسید.")
         rclpy.shutdown()
