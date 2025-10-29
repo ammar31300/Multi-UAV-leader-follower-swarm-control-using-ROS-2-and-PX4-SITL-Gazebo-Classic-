@@ -531,10 +531,20 @@ class LeaderController(Node):
 
             # 4) determine travel_time so everyone arrives together
             desired_speed = self.spacing
-            max_dist = max(dists) if dists else 0.0
-            travel_time = max_dist / desired_speed if desired_speed > 1e-6 else 0.0
-            t_arrival = now + travel_time
+            if manual_active:
+                travel_time = 1.0    # زمان پاسخ سریع برای کنترل دستی
+            else:
+                # از سرعت حداکثری که در بالا تعریف کردیم استفاده می‌کنیم
+                desired_speed = MAX_SWARM_SPEED
 
+                maxd = max(dists) if dists else 0.0
+                
+                # اطمینان از یک حداقل زمان سفر برای جلوگیری از سرعت‌های لحظه‌ای بالا
+                MIN_TRAVEL_TIME = 0.5 
+                travel_time = (maxd / desired_speed) if desired_speed > 1e-6 else 0.0
+                travel_time = max(travel_time, MIN_TRAVEL_TIME) # حرکت حداقل نیم ثانیه طول بکشد
+                
+            t_arrival = now + travel_time
             # 5) publish "follower_targets" (only followers, idx=0..N_FOLLOW-1)
             parts = []
             for i in range(1, M):

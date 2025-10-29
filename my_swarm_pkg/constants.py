@@ -2,6 +2,7 @@
 import math
 from rclpy.qos import QoSProfile, DurabilityPolicy
 
+MAX_SWARM_SPEED = 1.0 
 RATE_HZ = 20.0
 Z_CMD = -1.0
 LEADER_NS = 'px4_1'

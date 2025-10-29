@@ -32,6 +32,7 @@ setup(
             'main = my_swarm_pkg.main:main',
             'constants = my_swarm_pkg.constants:main',
             'leader_manual = my_swarm_pkg.leader_manual:main',
+            'mission_orchestrator = my_swarm_pkg.mission_orchestrator:main',
 
         ],
     },
