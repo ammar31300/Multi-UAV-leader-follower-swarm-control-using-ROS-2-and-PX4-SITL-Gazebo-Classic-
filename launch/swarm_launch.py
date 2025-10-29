@@ -11,7 +11,7 @@ def generate_launch_description():
         ExecuteProcess(
             cmd=[
                 'gnome-terminal', '--', 'bash', '-c',
-                "~/Firmware_clone/Tools/simulation/gazebo-classic/sitl_multiple_run.sh -m iris -n 4; exec bash"
+                "~/PX4-Autopilot/Tools/simulation/gazebo-classic/sitl_multiple_run.sh -m iris -n 4; exec bash"
             ],
             output='screen'
         )

@@ -20,13 +20,10 @@ from px4_msgs.msg import (
 from math import inf
 from my_swarm_pkg.constants import *
 
-# محدودیت‌های هوریزنتال و عمودی
-MAX_VZ = 0.5
-MIN_VZ   = -1.0      # سرعت نزولی (همیشه منفی، مثلا -1.0 تا -1.2)
-SAFE_ALT = 1.0       # متر هدف
-TAKEOFF_THRESHOLD = 1.8    # برگشت به فرمیشن
-KP_POS = 1.2         # گین کنترل تناسبی ارتفاع (بسته به سیستم تو)
-MIN_HORIZ_DELAY = 0.3  # تاخیر کوچک قبل از حرکت افقی [s]
+# Local control gains (override defaults if needed)
+# Note: Most constants are now imported from constants.py
+# MAX_VZ, MIN_VZ, SAFE_ALT, etc. are now defined in constants.py
+KP_POS_LOCAL = 1.2         # Local position control gain (can override KP_POS if needed)
 
 def quaternion_to_yaw(q):
     return math.atan2(
@@ -380,6 +377,19 @@ class FollowerController(Node):
         zd = self.z_target
         x0, y0, z0 = self.odom.position
 
+        # === ALTITUDE SAFETY CHECKS ===
+        target_alt = zd
+        # Check if target altitude is within safe limits
+        if target_alt > MIN_SAFE_ALTITUDE:  # Too low (remember NED: positive is down)
+            target_alt = MIN_SAFE_ALTITUDE
+            self.get_logger().warn(f"Follower {self.idx}: Target altitude too low, clamping to {abs(MIN_SAFE_ALTITUDE)}m")
+        elif target_alt < MAX_SAFE_ALTITUDE:  # Too high (remember NED: negative is up)
+            target_alt = MAX_SAFE_ALTITUDE
+            self.get_logger().warn(f"Follower {self.idx}: Target altitude too high, clamping to {abs(MAX_SAFE_ALTITUDE)}m")
+        
+        # Use the safety-checked altitude
+        zd = target_alt
+
         # Feed-forward
         rem = self.t_arrival - now
         if rem > MIN_HORIZ_DELAY:
@@ -397,6 +407,13 @@ class FollowerController(Node):
         vx = vx_ff + vx_p
         vy = vy_ff + vy_p
         vz = vz_ff + vz_p
+
+        # === VELOCITY SAFETY LIMITS ===
+        # Apply velocity limits for safety
+        if vz < 0:  # Ascending (negative velocity in NED)
+            vz = max(vz, MIN_VZ)  # Limit ascent speed
+        else:  # Descending (positive velocity in NED)
+            vz = min(vz, MAX_VZ)  # Limit descent speed
 
         # سقف سرعت کلی
         vmag = math.hypot(math.hypot(vx, vy), vz)

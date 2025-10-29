@@ -129,7 +129,7 @@ class LeaderController(Node):
         self.prev_time  = None
         # initial rotation angles (roll,pitch,yaw)
         self.rotation_angles = (0.0, 0.0, 0.0)
-        self.takeoff_altitude = 2.0     # متر
+        self.takeoff_altitude = TAKEOFF_ALT  # Use constant from constants.py
         self.took_off = False
         self._disarm_requested = False
         self._timer_handle = self.create_timer(1.0 / RATE_HZ, self.control_loop)
@@ -373,6 +373,15 @@ class LeaderController(Node):
         q = self.pose.q
         yaw_now = quaternion_to_yaw((q[0], q[1], q[2], q[3]))
         z_sp = self.takeoff_altitude if not self.took_off else self.pose.position[2]
+        
+        # === ALTITUDE SAFETY CHECK FOR LEADER ===
+        if z_sp > MIN_SAFE_ALTITUDE:  # Too low (remember NED: positive is down)
+            z_sp = MIN_SAFE_ALTITUDE
+            self.get_logger().warn(f"Leader altitude too low, clamping to {abs(MIN_SAFE_ALTITUDE)}m")
+        elif z_sp < MAX_SAFE_ALTITUDE:  # Too high (remember NED: negative is up)
+            z_sp = MAX_SAFE_ALTITUDE
+            self.get_logger().warn(f"Leader altitude too high, clamping to {abs(MAX_SAFE_ALTITUDE)}m")
+        
         sp = TrajectorySetpoint()
         sp.timestamp  = ts
         sp.position   = [
@@ -630,12 +639,8 @@ class LeaderController(Node):
             vx = vff_x + KP_POS * err_x + KD_POS * derr_x
             vy = vff_y + KP_POS * err_y + KD_POS * derr_y
             vz = vff_z + KP_POS * err_z + KD_POS * derr_z
-            if vz < 0:  # اگر در حال صعود هستیم (vz منفی است)
-                vz = max(vz, MAX_ASCENT_SPEED)  # استفاده از سقف سرعت صعود
-            else:  # اگر در حال فرود هستیم (vz مثبت است)
-                vz = min(vz, MAX_DESCENT_SPEED) # استفاده از سقف سرعت فرود
-                        # <<<--- شروع بخش اصلاح شده برای محدود کردن سرعت لیدر --->>>
-                        # محدود کردن سرعت افقی لیدر
+            
+            # محدود کردن سرعت افقی لیدر
             h_speed = math.sqrt(vx**2 + vy**2)
             if h_speed > MAX_LEADER_SPEED:
                 scale = MAX_LEADER_SPEED / h_speed
@@ -643,9 +648,10 @@ class LeaderController(Node):
                 vy *= scale
 
             # محدود کردن سرعت عمودی با مقادیر نامتقارن
-            vz = max(vz, MAX_ASCENT_SPEED)   # اعمال سقف سرعت صعود
-            vz = min(vz, MAX_DESCENT_SPEED)  # اعمال سقف سرعت فرود
-            # <<<--- پایان بخش اصلاح شده --->>>
+            if vz < 0:  # اگر در حال صعود هستیم (vz منفی است)
+                vz = max(vz, MAX_ASCENT_SPEED)  # استفاده از سقف سرعت صعود
+            else:  # اگر در حال فرود هستیم (vz مثبت است)
+                vz = min(vz, MAX_DESCENT_SPEED) # استفاده از سقف سرعت فرود
 
             # ذخیره خطا و زمان برای دوره بعد
             self.prev_error = (err_x, err_y, err_z)
