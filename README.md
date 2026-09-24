@@ -1,5 +1,4 @@
-# my_swarm_pkg  
-Multi-UAV leader–follower swarm control using ROS 2 and PX4 SITL (Gazebo Classic)
+#Multi-UAV leader–follower swarm control using ROS 2 and PX4 SITL (Gazebo Classic)
 
 ---
 
